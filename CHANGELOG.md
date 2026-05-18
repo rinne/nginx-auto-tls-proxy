@@ -2,7 +2,15 @@
 
 All notable changes to `nginx-auto-tls-proxy` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-05-18
+
+### Added
+
+- New `SITE_REDIRECTS` environment variable for 302-redirect-only hostnames. Format: comma-separated `source:destination[:mode]` where `mode` is `no-deep` (default; always lands on `https://destination/`) or `deep` (preserves the original request URI). Redirect source hostnames still get their own SNI certs and serve ACME challenges normally so cert renewal keeps working.
+- HTTP-side redirect for `SITE_REDIRECTS` sources is single-hop: requests on port 80 go directly to the final HTTPS destination instead of first 302'ing to `https://<self>/`.
+- `tests/smoke.sh` gains positive coverage for both `no-deep` and `deep` redirect modes plus a single-hop HTTP-side assertion.
+
+## [0.2.0] - 2026-05-18
 
 ### Added
 

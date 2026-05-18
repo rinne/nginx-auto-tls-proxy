@@ -40,6 +40,7 @@ services:
       STATIC_SITE_ROOTS: "custom.local:/custom/custom.local"
       PROXY_SITES: "proxy.local:http://backend/"
       SITE_ALIASES: "default.local:www.default.local"
+      SITE_REDIRECTS: "shallow.local:default.local,deep.local:default.local:deep,explicit.local:default.local:no-deep"
       LETSENCRYPT_EMAIL: ""
       CLIENT_MAX_BODY_SIZE: "16m"
       PROXY_READ_TIMEOUT: "60s"
@@ -85,6 +86,56 @@ curl -fksS --resolve "proxy.local:$HTTPS_PORT:127.0.0.1" \
 
 "${COMPOSE[@]}" exec -T proxy sh -c \
     "grep -q 'proxy_set_header Upgrade' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf && grep -q 'proxy_set_header Connection' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf"
+
+# --- SITE_REDIRECTS coverage ---
+# Assert that a curl request returns 302 with the expected redirect_url. Uses
+# curl's `-w '%{redirect_url}'` writeout, which is reliable across HTTP/1.1
+# (Location:) and HTTP/2 (location:) without local header parsing.
+assert_redirect() {
+    local desc="$1" expected="$2"; shift 2
+    local code redir
+    code="$(curl -ksS -o /dev/null -w '%{http_code}'    "$@")"
+    redir="$(curl -ksS -o /dev/null -w '%{redirect_url}' "$@")"
+    [[ "$code" == "302" ]] \
+        || { printf 'FAIL: %s status was %s, expected 302\n' "$desc" "$code"; exit 1; }
+    [[ "$redir" == "$expected" ]] \
+        || { printf 'FAIL: %s redirected to %q, expected %q\n' "$desc" "$redir" "$expected"; exit 1; }
+}
+
+# no-deep (default): HTTPS request on shallow.local/any/path -> root of destination.
+assert_redirect 'HTTPS shallow.local (default no-deep)' \
+    'https://default.local/' \
+    --resolve "shallow.local:$HTTPS_PORT:127.0.0.1" "https://shallow.local:$HTTPS_PORT/some/path?q=1"
+
+# Explicit :no-deep behaves the same as the default.
+assert_redirect 'HTTPS explicit.local (explicit no-deep)' \
+    'https://default.local/' \
+    --resolve "explicit.local:$HTTPS_PORT:127.0.0.1" "https://explicit.local:$HTTPS_PORT/deep/path"
+
+# deep: HTTPS request preserves $request_uri (path + query).
+assert_redirect 'HTTPS deep.local (deep)' \
+    'https://default.local/some/path?q=1' \
+    --resolve "deep.local:$HTTPS_PORT:127.0.0.1" "https://deep.local:$HTTPS_PORT/some/path?q=1"
+
+# HTTP-side single-hop: redirect goes directly to the final destination, NOT
+# via https://<self>/ first. shallow.local on HTTP should land on
+# https://default.local/ (no-deep) regardless of the request path.
+assert_redirect 'HTTP shallow.local (single-hop no-deep)' \
+    'https://default.local/' \
+    -H 'Host: shallow.local' "http://127.0.0.1:$HTTP_PORT/some/path?q=1"
+
+# HTTP-side single-hop deep mode.
+assert_redirect 'HTTP deep.local (single-hop deep)' \
+    'https://default.local/some/path?q=1' \
+    -H 'Host: deep.local' "http://127.0.0.1:$HTTP_PORT/some/path?q=1"
+
+# Redirect sources still serve ACME challenges on port 80 (so cert renewal works).
+"${COMPOSE[@]}" exec -T proxy sh -c \
+    'printf challenge-shallow > /var/www/acme/.well-known/acme-challenge/shallow-token'
+curl -fsS -H 'Host: shallow.local' \
+    "http://127.0.0.1:$HTTP_PORT/.well-known/acme-challenge/shallow-token" \
+    | grep -q 'challenge-shallow' \
+    || { printf 'FAIL: ACME challenge passthrough broken on redirect source shallow.local\n'; exit 1; }
 
 # Tear down the main stack before the negative-test substack, so we don't fight
 # over container names / ports.

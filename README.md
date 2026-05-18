@@ -99,8 +99,9 @@ docker compose -f dc/try/docker-compose.yaml down -v
 | `STATIC_PHP_SITES` | `blog.example.com,wiki.example.com` | Comma-separated PHP-enabled static site hostnames. See [PHP-Enabled Sites](#php-enabled-sites). **Requires the `:-php` image tag.** |
 | `STATIC_SITE_ROOTS` | `docs.example.com:/htdocs/docs` | Optional `domain:absolute-path` overrides for selected static site roots (works for both `STATIC_SITES` and `STATIC_PHP_SITES`). |
 | `PROXY_SITES` | `app.example.com:http://app:3000/` | Comma-separated `domain:upstream-url` reverse proxy mappings. |
-| `SITE_ALIASES` | `example.com:www.example.com,old.example.com` | Aliases per primary site. Aliases inherit the primary's type (static, static-php, or proxy). Bare aliases extend the preceding `primary:alias` group. |
-| `DEFAULT_SITE` | `example.com` | Optional target for unknown HTTP hostnames. May reference any primary from `STATIC_SITES`, `STATIC_PHP_SITES`, or `PROXY_SITES`. Unknown HTTPS SNI is still rejected. |
+| `SITE_REDIRECTS` | `old.example.com:example.com,api2.example.com:api.example.com:deep` | Comma-separated `source:destination[:mode]` 302-redirect rules. `mode` is `no-deep` (default) or `deep`. See [Redirect Sites](#redirect-sites). |
+| `SITE_ALIASES` | `example.com:www.example.com,old.example.com` | Aliases per primary site. Aliases inherit the primary's type (static, static-php, proxy, or redirect). Bare aliases extend the preceding `primary:alias` group. |
+| `DEFAULT_SITE` | `example.com` | Optional target for unknown HTTP hostnames. May reference any primary from `STATIC_SITES`, `STATIC_PHP_SITES`, `PROXY_SITES`, or `SITE_REDIRECTS`. Unknown HTTPS SNI is still rejected. |
 | `BASIC_AUTH_FILES` | `admin.example.com:/run/secrets/admin.htpasswd` | Optional mounted htpasswd files per site. |
 | `CLIENT_MAX_BODY_SIZE` | `16m` | nginx request body limit for generated HTTPS servers. On `:-php` images this also drives PHP's `upload_max_filesize` and `post_max_size` so the two layers never disagree. |
 | `PROXY_READ_TIMEOUT` | `60s` | Reverse-proxy read timeout. |
@@ -134,6 +135,32 @@ volumes:
 ```
 
 `docs.example.com` serves `/htdocs/docs`; `example.com` serves `/sites/example.com`.
+
+## Redirect Sites
+
+`SITE_REDIRECTS` declares hostnames that exist only to **302-redirect** to another host. Useful for retiring old domain names, consolidating brands onto a canonical site, or pointing one hostname at another while keeping certs and ACME challenges working on the source.
+
+Format: comma-separated `source:destination[:mode]`. Mode is `no-deep` (default) or `deep`.
+
+| Example entry | Result |
+|---|---|
+| `old.example.com:example.com` | Any request to `https://old.example.com/anything` 302s to `https://example.com/` (drops the path). |
+| `old.example.com:example.com:no-deep` | Same — `:no-deep` is the default; this form is just explicit. |
+| `api2.example.com:api.example.com:deep` | Any request to `https://api2.example.com/foo/bar?x=1` 302s to `https://api.example.com/foo/bar?x=1` (preserves the path and query). |
+
+```yaml
+environment:
+  SITE_REDIRECTS: "old.example.com:example.com,api2.example.com:api.example.com:deep"
+```
+
+Other behavior worth knowing:
+
+- **Destination is a bare hostname.** Scheme is implicitly `https`. The destination need not be one of your own configured sites — it can be any external host.
+- **Source still gets its own TLS cert** (self-signed at first, Let's Encrypt if enabled), so the 302 can be served over HTTPS with the correct SNI. Make sure the source's DNS resolves to this container before enabling Let's Encrypt for it.
+- **ACME challenges still work** on the source — port 80's `/.well-known/acme-challenge/` is handled before the redirect, so certbot can renew normally.
+- **Single hop, not two.** Plain HTTP requests to the source 302 directly to the final destination rather than first 302'ing to `https://<self>/` (the usual HTTP→HTTPS pattern). One redirect, not two.
+- **Mutually exclusive primaries.** A hostname listed in `SITE_REDIRECTS` cannot also be in `STATIC_SITES`, `STATIC_PHP_SITES`, or `PROXY_SITES`. The entrypoint fails fast on overlap.
+- **Aliases work.** `SITE_ALIASES=old.example.com:legacy.example.com` together with a `SITE_REDIRECTS` entry for `old.example.com` makes `legacy.example.com` redirect to the same destination.
 
 ## Reverse Proxy Sites
 

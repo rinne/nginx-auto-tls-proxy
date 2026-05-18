@@ -107,9 +107,15 @@ site_mode() {
         printf 'proxy'
     elif [[ "${STATIC_PHP_SITE_MAP["$site"]+isset}" == "isset" ]]; then
         printf 'static-php'
+    elif [[ "${REDIRECT_MAP["$site"]+isset}" == "isset" ]]; then
+        printf 'redirect'
     else
         printf 'static'
     fi
+}
+
+is_valid_redirect_mode() {
+    [[ "$1" == "deep" || "$1" == "no-deep" ]]
 }
 
 nginx_auth_lines() {
@@ -211,6 +217,8 @@ mkdir -p \
 declare -A STATIC_SITE_MAP=()
 declare -A STATIC_PHP_SITE_MAP=()
 declare -A PROXY_MAP=()
+declare -A REDIRECT_MAP=()
+declare -A REDIRECT_MODE_MAP=()
 declare -A SITE_ALIASES_MAP=()
 declare -A STATIC_ROOT_MAP=()
 declare -A ALL_SITE_MAP=()
@@ -219,6 +227,7 @@ declare -A BASIC_AUTH_MAP=()
 declare -a STATIC_SITES_ARR=()
 declare -a STATIC_PHP_SITES_ARR=()
 declare -a PROXY_SITES_ARR=()
+declare -a REDIRECT_SITES_ARR=()
 declare -a ALL_SITES=()
 
 # Static sites: STATIC_SITES=domain.com,domain2.com
@@ -275,6 +284,42 @@ if [[ -n "${PROXY_SITES:-}" ]]; then
         PROXY_SITES_ARR+=("$_site")
         ALL_SITE_MAP["$_site"]=1
         ALL_SITES+=("$_site")
+    done
+fi
+
+# Redirect-only sites: SITE_REDIRECTS=source:destination[:mode]
+# Mode is 'no-deep' (default, redirects every path to https://destination/)
+# or 'deep' (redirects to https://destination + the original request URI).
+# Destination is a bare hostname; scheme is implicitly https.
+if [[ -n "${SITE_REDIRECTS:-}" ]]; then
+    IFS=',' read -ra _parts <<< "$SITE_REDIRECTS"
+    for _p in "${_parts[@]}"; do
+        _p="$(trim_spaces "$_p")"
+        [[ -z "$_p" ]] && continue
+        IFS=':' read -ra _fields <<< "$_p"
+        if [[ ${#_fields[@]} -lt 2 || ${#_fields[@]} -gt 3 ]]; then
+            die "Malformed SITE_REDIRECTS entry, expected source:destination[:mode]: $_p"
+        fi
+        _src="$(lower "$(trim_spaces "${_fields[0]}")")"
+        _dst="$(lower "$(trim_spaces "${_fields[1]}")")"
+        if [[ ${#_fields[@]} -eq 3 ]]; then
+            _mode="$(lower "$(trim_spaces "${_fields[2]}")")"
+        else
+            _mode="no-deep"
+        fi
+        require_hostname "$_src" "SITE_REDIRECTS"
+        require_hostname "$_dst" "SITE_REDIRECTS"
+        is_valid_redirect_mode "$_mode" || die "SITE_REDIRECTS mode for $_src must be 'no-deep' or 'deep'; got: $_mode"
+        [[ "$_src" == "$_dst" ]] && die "Redirect source cannot equal destination in SITE_REDIRECTS: $_src"
+        [[ "${STATIC_SITE_MAP["$_src"]+isset}"     == "isset" ]] && die "$_src is configured in both STATIC_SITES and SITE_REDIRECTS"
+        [[ "${STATIC_PHP_SITE_MAP["$_src"]+isset}" == "isset" ]] && die "$_src is configured in both STATIC_PHP_SITES and SITE_REDIRECTS"
+        [[ "${PROXY_MAP["$_src"]+isset}"           == "isset" ]] && die "$_src is configured in both PROXY_SITES and SITE_REDIRECTS"
+        [[ "${REDIRECT_MAP["$_src"]+isset}"        == "isset" ]] && die "Duplicate SITE_REDIRECTS source: $_src"
+        REDIRECT_MAP["$_src"]="$_dst"
+        REDIRECT_MODE_MAP["$_src"]="$_mode"
+        REDIRECT_SITES_ARR+=("$_src")
+        ALL_SITE_MAP["$_src"]=1
+        ALL_SITES+=("$_src")
     done
 fi
 
@@ -520,6 +565,23 @@ generate_site_config() {
         server_names="$server_names $alias"
     done
 
+    # HTTP-side redirect target. For redirect sites we go straight to the final
+    # destination — no wasteful double 302 through https://<self>. For every
+    # other mode the HTTP block 302s to the matching HTTPS server block on the
+    # same host, as before.
+    local http_redirect_target
+    if [[ "$mode" == "redirect" ]]; then
+        local _dst_host="${REDIRECT_MAP["$site"]}"
+        local _dst_mode="${REDIRECT_MODE_MAP["$site"]}"
+        if [[ "$_dst_mode" == "deep" ]]; then
+            http_redirect_target="https://${_dst_host}\$request_uri"
+        else
+            http_redirect_target="https://${_dst_host}/"
+        fi
+    else
+        http_redirect_target="https://${site}\$request_uri"
+    fi
+
     cat > "$conf" <<NGINXEOF
 server {
     listen 80;
@@ -531,11 +593,34 @@ server {
     }
 
     location / {
-        return 302 https://$site\$request_uri;
+        return 302 $http_redirect_target;
     }
 }
 
 NGINXEOF
+
+    if [[ "$mode" == "redirect" ]]; then
+        cat >> "$conf" <<NGINXEOF
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name $server_names;
+
+    ssl_certificate     /ssl/$site/ssl.crt;
+    ssl_certificate_key /ssl/$site/ssl.key;
+$(nginx_ocsp_lines "$site")
+$(nginx_hsts_line)
+    include /etc/nginx/site-conf.d/$site/*.conf;
+
+    location / {
+$(nginx_auth_lines "$site")
+        return 302 $http_redirect_target;
+    }
+}
+NGINXEOF
+        log "Config written for $site (mode=redirect -> $http_redirect_target)"
+        return
+    fi
 
     if [[ "$mode" == "proxy" ]]; then
         local proxy_url="${PROXY_MAP["$site"]}"
@@ -652,11 +737,14 @@ print_startup_summary() {
     for site in "${ALL_SITES[@]}"; do
         mode="$(site_mode "$site")"
         aliases="$(trim_spaces "$(site_aliases "$site")")"
-        if [[ "$mode" == "proxy" ]]; then
-            target="${PROXY_MAP["$site"]}"
-        else
-            target="$(site_static_root "$site")"
-        fi
+        case "$mode" in
+            proxy)
+                target="${PROXY_MAP["$site"]}" ;;
+            redirect)
+                target="https://${REDIRECT_MAP["$site"]} (${REDIRECT_MODE_MAP["$site"]})" ;;
+            *)
+                target="$(site_static_root "$site")" ;;
+        esac
         log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")"
     done
 }
