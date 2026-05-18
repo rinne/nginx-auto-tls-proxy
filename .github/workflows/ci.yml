@@ -11,5 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Smoke test
+      - name: Smoke test (plain image)
         run: tests/smoke.sh
+      - name: Smoke test (-php image)
+        run: tests/smoke-php.sh

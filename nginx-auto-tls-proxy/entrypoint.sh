@@ -1,7 +1,9 @@
 #!/bin/bash
 # nginx-auto-tls-proxy entrypoint
 # Generates nginx config from environment, prepares static roots and fallback
-# certs, then optionally manages Let's Encrypt certificates.
+# certs, then optionally manages Let's Encrypt certificates. When the image is
+# built with WITH_PHP=1 and STATIC_PHP_SITES is non-empty, also configures and
+# supervises php-fpm.
 set -uo pipefail
 
 log()  { echo "[nginx-auto-tls-proxy] $*"; }
@@ -18,6 +20,10 @@ trim_spaces() {
 
 lower() {
     printf '%s' "${1,,}"
+}
+
+upper() {
+    printf '%s' "${1^^}"
 }
 
 is_valid_hostname() {
@@ -61,6 +67,27 @@ is_positive_int() {
     [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
+is_non_negative_int() {
+    [[ "$1" =~ ^(0|[1-9][0-9]*)$ ]]
+}
+
+# PHP memory limit: integer + optional K/M/G suffix, or '-1' for unlimited.
+is_php_memory_limit() {
+    [[ "$1" == "-1" ]] && return 0
+    [[ "$1" =~ ^[1-9][0-9]*[KMG]?$ ]]
+}
+
+# Convert a nginx-style size (e.g. 16m, 512K, 2g) to PHP-style (uppercase suffix).
+# Bare integers pass through unchanged.
+nginx_size_to_php() {
+    local v="$1"
+    if [[ "$v" =~ ^([0-9]+)([kKmMgG])$ ]]; then
+        printf '%s%s' "${BASH_REMATCH[1]}" "$(upper "${BASH_REMATCH[2]}")"
+    else
+        printf '%s' "$v"
+    fi
+}
+
 site_exists() {
     [[ "${ALL_SITE_MAP["$1"]+isset}" == "isset" ]]
 }
@@ -78,6 +105,8 @@ site_mode() {
     local site="$1"
     if [[ "${PROXY_MAP["$site"]+isset}" == "isset" ]]; then
         printf 'proxy'
+    elif [[ "${STATIC_PHP_SITE_MAP["$site"]+isset}" == "isset" ]]; then
+        printf 'static-php'
     else
         printf 'static'
     fi
@@ -114,6 +143,17 @@ nginx_static_fallback_lines() {
     cat <<'EOF'
     error_page 404 /404.html;
     error_page 500 502 503 504 /50x.html;
+EOF
+}
+
+# Curated sensitive-path denylist applied to STATIC_PHP_SITES server blocks.
+nginx_php_denylist() {
+    cat <<'EOF'
+    location ~ /\.                                                                      { deny all; return 404; }
+    location ~ ^/(composer\.(json|lock)|package(-lock)?\.json|yarn\.lock|\.env([^/]*)?)$ { deny all; return 404; }
+    location ~ \.(bak|swp|orig)$                                                        { deny all; return 404; }
+    location ~ ~$                                                                       { deny all; return 404; }
+    location ~ ^/(vendor|node_modules)/.*\.php$                                         { deny all; return 404; }
 EOF
 }
 
@@ -169,6 +209,7 @@ mkdir -p \
     /sites
 
 declare -A STATIC_SITE_MAP=()
+declare -A STATIC_PHP_SITE_MAP=()
 declare -A PROXY_MAP=()
 declare -A SITE_ALIASES_MAP=()
 declare -A STATIC_ROOT_MAP=()
@@ -176,6 +217,7 @@ declare -A ALL_SITE_MAP=()
 declare -A SERVER_NAME_OWNER=()
 declare -A BASIC_AUTH_MAP=()
 declare -a STATIC_SITES_ARR=()
+declare -a STATIC_PHP_SITES_ARR=()
 declare -a PROXY_SITES_ARR=()
 declare -a ALL_SITES=()
 
@@ -194,6 +236,27 @@ if [[ -n "${STATIC_SITES:-}" ]]; then
     done
 fi
 
+# PHP-enabled static sites: STATIC_PHP_SITES=blog.example.com,wiki.example.com
+# These behave like STATIC_SITES except *.php files are executed via php-fpm.
+# Only valid when the image was built with WITH_PHP=1.
+if [[ -n "${STATIC_PHP_SITES:-}" ]]; then
+    if ! command -v php-fpm >/dev/null 2>&1; then
+        die "STATIC_PHP_SITES is set but this image was built without PHP support; use the nginx-auto-tls-proxy:<ver>-php tag"
+    fi
+    IFS=',' read -ra _parts <<< "$STATIC_PHP_SITES"
+    for _p in "${_parts[@]}"; do
+        _site="$(lower "$(trim_spaces "$_p")")"
+        [[ -z "$_site" ]] && continue
+        require_hostname "$_site" "STATIC_PHP_SITES"
+        [[ "${STATIC_SITE_MAP["$_site"]+isset}" == "isset" ]] && die "$_site is configured in both STATIC_SITES and STATIC_PHP_SITES"
+        [[ "${STATIC_PHP_SITE_MAP["$_site"]+isset}" == "isset" ]] && die "Duplicate STATIC_PHP_SITES entry: $_site"
+        STATIC_PHP_SITE_MAP["$_site"]=1
+        STATIC_PHP_SITES_ARR+=("$_site")
+        ALL_SITE_MAP["$_site"]=1
+        ALL_SITES+=("$_site")
+    done
+fi
+
 # Proxy sites: PROXY_SITES=app.com:http://backend:3000/
 if [[ -n "${PROXY_SITES:-}" ]]; then
     IFS=',' read -ra _parts <<< "$PROXY_SITES"
@@ -206,6 +269,7 @@ if [[ -n "${PROXY_SITES:-}" ]]; then
         require_hostname "$_site" "PROXY_SITES"
         is_safe_url "$_url" || die "Invalid upstream URL for $_site in PROXY_SITES: $_url"
         [[ "${STATIC_SITE_MAP["$_site"]+isset}" == "isset" ]] && die "$_site is configured in both STATIC_SITES and PROXY_SITES"
+        [[ "${STATIC_PHP_SITE_MAP["$_site"]+isset}" == "isset" ]] && die "$_site is configured in both STATIC_PHP_SITES and PROXY_SITES"
         [[ "${PROXY_MAP["$_site"]+isset}" == "isset" ]] && die "Duplicate PROXY_SITES entry: $_site"
         PROXY_MAP["$_site"]="$_url"
         PROXY_SITES_ARR+=("$_site")
@@ -240,6 +304,7 @@ if [[ -n "${SITE_ALIASES:-}" ]]; then
 fi
 
 # Custom roots for static sites: STATIC_SITE_ROOTS=domain.com:/custom/htdocs
+# Also valid for STATIC_PHP_SITES entries.
 if [[ -n "${STATIC_SITE_ROOTS:-}" ]]; then
     IFS=',' read -ra _parts <<< "$STATIC_SITE_ROOTS"
     for _p in "${_parts[@]}"; do
@@ -250,7 +315,10 @@ if [[ -n "${STATIC_SITE_ROOTS:-}" ]]; then
         _root="$(trim_spaces "${_p#*:}")"
         require_hostname "$_site" "STATIC_SITE_ROOTS"
         require_safe_path "$_root" "STATIC_SITE_ROOTS root for $_site"
-        [[ "${STATIC_SITE_MAP["$_site"]+isset}" == "isset" ]] || die "STATIC_SITE_ROOTS entry for $_site has no matching STATIC_SITES entry"
+        if [[ "${STATIC_SITE_MAP["$_site"]+isset}" != "isset" \
+              && "${STATIC_PHP_SITE_MAP["$_site"]+isset}" != "isset" ]]; then
+            die "STATIC_SITE_ROOTS entry for $_site has no matching STATIC_SITES or STATIC_PHP_SITES entry"
+        fi
         STATIC_ROOT_MAP["$_site"]="$_root"
     done
 fi
@@ -308,6 +376,12 @@ REAL_IP_HEADER="${REAL_IP_HEADER:-X-Forwarded-For}"
 LETSENCRYPT_RENEW_INTERVAL_SECONDS="${LETSENCRYPT_RENEW_INTERVAL_SECONDS:-43200}"
 LE_RENEW_BEFORE_DAYS="${LE_RENEW_BEFORE_DAYS:-30}"
 
+# PHP-related env (only meaningful on the -php image with PHP sites configured).
+PHP_MEMORY_LIMIT="${PHP_MEMORY_LIMIT:-128M}"
+PHP_MAX_EXECUTION_TIME="${PHP_MAX_EXECUTION_TIME:-30}"
+PHP_FPM_PROFILE_RAW="${PHP_FPM_PROFILE:-M}"
+PHP_FPM_PROFILE="$(upper "$(trim_spaces "$PHP_FPM_PROFILE_RAW")")"
+
 is_safe_size "$CLIENT_MAX_BODY_SIZE" || die "CLIENT_MAX_BODY_SIZE must look like 16m, 512k, or 1g"
 is_safe_duration "$PROXY_READ_TIMEOUT" || die "PROXY_READ_TIMEOUT must look like 60s, 5m, or 1h"
 is_safe_duration "$PROXY_SEND_TIMEOUT" || die "PROXY_SEND_TIMEOUT must look like 60s, 5m, or 1h"
@@ -319,10 +393,22 @@ is_positive_int "$LETSENCRYPT_RENEW_INTERVAL_SECONDS" || die "LETSENCRYPT_RENEW_
 is_positive_int "$LE_RENEW_BEFORE_DAYS" || die "LE_RENEW_BEFORE_DAYS must be a positive integer"
 LE_RENEW_BEFORE_SECONDS=$((LE_RENEW_BEFORE_DAYS * 86400))
 
+is_php_memory_limit "$PHP_MEMORY_LIMIT" || die "PHP_MEMORY_LIMIT must look like 128M, 256M, 1G, or -1; got: $PHP_MEMORY_LIMIT"
+is_non_negative_int "$PHP_MAX_EXECUTION_TIME" || die "PHP_MAX_EXECUTION_TIME must be a non-negative integer (0 = unlimited); got: $PHP_MAX_EXECUTION_TIME"
+case "$PHP_FPM_PROFILE" in
+    S|M|L|XL|XXL) ;;
+    *) die "PHP_FPM_PROFILE must be one of S, M, L, XL, XXL (case-insensitive); got: $PHP_FPM_PROFILE_RAW" ;;
+esac
+
+# Derived values used by both nginx and PHP configs.
+PHP_UPLOAD_LIMIT="$(nginx_size_to_php "$CLIENT_MAX_BODY_SIZE")"
+PHP_REQUEST_TERMINATE_TIMEOUT=$((PHP_MAX_EXECUTION_TIME + 5))
+FASTCGI_READ_TIMEOUT_SECONDS=$((PHP_MAX_EXECUTION_TIME + 30))
+
 log "Sites: ${ALL_SITES[*]:-<none>}"
 
-# Prepare static roots and placeholder content.
-for _site in "${STATIC_SITES_ARR[@]}"; do
+# Prepare static roots and placeholder content (for both static and static-php sites).
+for _site in "${STATIC_SITES_ARR[@]}" "${STATIC_PHP_SITES_ARR[@]}"; do
     _dir="$(site_static_root "$_site")"
     mkdir -p "$_dir"
     if [[ ! -f "$_dir/index.html" ]]; then
@@ -427,6 +513,8 @@ generate_site_config() {
     local conf="/etc/nginx/conf.d/nginx-auto-tls-proxy-${site}.conf"
     local server_names="$site"
     local alias
+    local mode
+    mode="$(site_mode "$site")"
 
     for alias in $(site_aliases "$site"); do
         server_names="$server_names $alias"
@@ -449,7 +537,7 @@ server {
 
 NGINXEOF
 
-    if [[ "$(site_mode "$site")" == "proxy" ]]; then
+    if [[ "$mode" == "proxy" ]]; then
         local proxy_url="${PROXY_MAP["$site"]}"
         cat >> "$conf" <<NGINXEOF
 server {
@@ -476,6 +564,50 @@ $(nginx_auth_lines "$site")
         proxy_set_header Connection        \$connection_upgrade;
         proxy_read_timeout                 $PROXY_READ_TIMEOUT;
         proxy_send_timeout                 $PROXY_SEND_TIMEOUT;
+    }
+}
+NGINXEOF
+    elif [[ "$mode" == "static-php" ]]; then
+        local site_root
+        site_root="$(site_static_root "$site")"
+        cat >> "$conf" <<NGINXEOF
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name $server_names;
+
+    ssl_certificate     /ssl/$site/ssl.crt;
+    ssl_certificate_key /ssl/$site/ssl.key;
+$(nginx_ocsp_lines "$site")
+    client_max_body_size $CLIENT_MAX_BODY_SIZE;
+$(nginx_hsts_line)
+    include /etc/nginx/site-conf.d/$site/*.conf;
+
+    root "$site_root";
+    index index.php index.html index.htm;
+$(nginx_static_fallback_lines)
+
+$(nginx_php_denylist)
+
+    location / {
+$(nginx_auth_lines "$site")
+        try_files \$uri \$uri/ =404;
+    }
+
+    location ~ \.php\$ {
+$(nginx_auth_lines "$site")
+        try_files \$uri =404;
+        fastcgi_split_path_info ^(.+\.php)(/.+)\$;
+        fastcgi_pass unix:/run/php-fpm.sock;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param PATH_INFO \$fastcgi_path_info;
+        fastcgi_param HTTPS on;
+        fastcgi_buffer_size       16k;
+        fastcgi_buffers         8 16k;
+        fastcgi_busy_buffers_size 32k;
+        fastcgi_read_timeout      ${FASTCGI_READ_TIMEOUT_SECONDS}s;
     }
 }
 NGINXEOF
@@ -507,7 +639,7 @@ $(nginx_auth_lines "$site")
 NGINXEOF
     fi
 
-    log "Config written for $site"
+    log "Config written for $site (mode=$mode)"
 }
 
 print_startup_summary() {
@@ -527,6 +659,87 @@ print_startup_summary() {
         fi
         log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")"
     done
+}
+
+# Render the FPM pool from PHP_FPM_PROFILE, plus the derived ini drop-in.
+render_php_runtime_config() {
+    [[ "${#STATIC_PHP_SITES_ARR[@]}" -gt 0 ]] || return 0
+
+    local php_conf_d="/etc/nginx-auto-tls-proxy/php/conf.d"
+    local fpm_pool_d="/etc/nginx-auto-tls-proxy/php/php-fpm.d"
+    mkdir -p "$php_conf_d" "$fpm_pool_d"
+
+    # Derived ini: ties memory/upload/timeout to the env vars.
+    cat > "$php_conf_d/zz-derived.ini" <<INIEOF
+; nginx-auto-tls-proxy entrypoint-derived PHP settings.
+; Written at startup; overwritten on every container start.
+
+memory_limit = $PHP_MEMORY_LIMIT
+max_execution_time = $PHP_MAX_EXECUTION_TIME
+
+; upload_max_filesize and post_max_size stay in lockstep with nginx's
+; client_max_body_size so users can't get silent body truncation.
+upload_max_filesize = $PHP_UPLOAD_LIMIT
+post_max_size       = $PHP_UPLOAD_LIMIT
+INIEOF
+
+    # FPM pool config — values chosen by PHP_FPM_PROFILE.
+    local pm pm_lines max_children start_servers min_spare max_spare max_requests
+    case "$PHP_FPM_PROFILE" in
+        S)
+            pm=ondemand;  max_children=5;   max_requests=500;
+            pm_lines="" ;;
+        M)
+            pm=dynamic;   max_children=20;  start_servers=2;  min_spare=1; max_spare=4;  max_requests=500
+            pm_lines=$'pm.start_servers = 2\npm.min_spare_servers = 1\npm.max_spare_servers = 4' ;;
+        L)
+            pm=dynamic;   max_children=50;  start_servers=4;  min_spare=2; max_spare=10; max_requests=500
+            pm_lines=$'pm.start_servers = 4\npm.min_spare_servers = 2\npm.max_spare_servers = 10' ;;
+        XL)
+            pm=dynamic;   max_children=100; start_servers=8;  min_spare=4; max_spare=20; max_requests=500
+            pm_lines=$'pm.start_servers = 8\npm.min_spare_servers = 4\npm.max_spare_servers = 20' ;;
+        XXL)
+            pm=static;    max_children=200; max_requests=1000
+            pm_lines="" ;;
+    esac
+
+    cat > "$fpm_pool_d/www.conf" <<FPMEOF
+; nginx-auto-tls-proxy entrypoint-rendered FPM pool.
+; Written at startup from PHP_FPM_PROFILE=$PHP_FPM_PROFILE.
+; Overwritten on every container start. Add overrides as separate files
+; in this directory (sorted lexically; later files override).
+
+[www]
+user  = nginx
+group = nginx
+listen = /run/php-fpm.sock
+listen.owner = nginx
+listen.group = nginx
+listen.mode  = 0660
+
+pm = $pm
+pm.max_children = $max_children
+pm.max_requests = $max_requests
+pm.process_idle_timeout = 10s
+${pm_lines}
+
+request_terminate_timeout = ${PHP_REQUEST_TERMINATE_TIMEOUT}s
+
+; Hardening: refuse to execute anything that isn't .php.
+security.limit_extensions = .php
+
+; Health probe used by /usr/local/bin/healthcheck.sh.
+ping.path = /ping
+ping.response = pong
+
+; Worker stderr captured by FPM so 'docker logs' shows PHP errors.
+catch_workers_output = yes
+decorate_workers_output = no
+clear_env = no
+FPMEOF
+
+    log "PHP_FPM_PROFILE=$PHP_FPM_PROFILE -> pm=$pm max_children=$max_children"
+    log "PHP runtime: memory_limit=$PHP_MEMORY_LIMIT max_execution_time=${PHP_MAX_EXECUTION_TIME}s upload/post=$PHP_UPLOAD_LIMIT"
 }
 
 # Remove only configs generated by this image. Mounted custom snippets are left alone.
@@ -576,6 +789,7 @@ else
     log "No sites configured."
 fi
 
+render_php_runtime_config
 print_startup_summary
 
 log "Testing nginx config..."
@@ -592,9 +806,22 @@ log "Starting nginx..."
 nginx -g 'daemon off;' &
 NGINX_PID=$!
 
+PHP_FPM_PID=""
+if [[ "${#STATIC_PHP_SITES_ARR[@]}" -gt 0 ]]; then
+    log "Starting php-fpm (profile=$PHP_FPM_PROFILE)..."
+    /usr/local/sbin/php-fpm --nodaemonize --force-stderr &
+    PHP_FPM_PID=$!
+fi
+
 _shutdown() {
-    log "Shutting down nginx..."
+    log "Shutting down..."
+    if [[ -n "$PHP_FPM_PID" ]]; then
+        kill "$PHP_FPM_PID" 2>/dev/null || true
+    fi
     kill "$NGINX_PID" 2>/dev/null || true
+    if [[ -n "$PHP_FPM_PID" ]]; then
+        wait "$PHP_FPM_PID" 2>/dev/null || true
+    fi
     wait "$NGINX_PID" 2>/dev/null || true
 }
 trap '_shutdown; exit 0' SIGTERM SIGINT
@@ -665,4 +892,10 @@ elif [[ -n "${LETSENCRYPT_EMAIL:-}" ]]; then
 fi
 
 log "nginx-auto-tls-proxy ready."
-wait "$NGINX_PID"
+if [[ -n "$PHP_FPM_PID" ]]; then
+    wait -n "$NGINX_PID" "$PHP_FPM_PID"
+    log "A supervised process exited; gracefully stopping the other before exiting."
+    _shutdown
+else
+    wait "$NGINX_PID"
+fi

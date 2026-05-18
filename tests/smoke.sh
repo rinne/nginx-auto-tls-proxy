@@ -86,4 +86,34 @@ curl -fksS --resolve "proxy.local:$HTTPS_PORT:127.0.0.1" \
 "${COMPOSE[@]}" exec -T proxy sh -c \
     "grep -q 'proxy_set_header Upgrade' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf && grep -q 'proxy_set_header Connection' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf"
 
+# Tear down the main stack before the negative-test substack, so we don't fight
+# over container names / ports.
+"${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+
+# --- Negative: plain image must reject STATIC_PHP_SITES with a clear error. ---
+NEG_COMPOSE_FILE="$TMP_DIR/docker-compose-php-negative.yaml"
+cat > "$NEG_COMPOSE_FILE" <<EOF
+services:
+  proxy:
+    build:
+      context: "$ROOT_DIR/nginx-auto-tls-proxy"
+    environment:
+      STATIC_PHP_SITES: "must-fail.local"
+      LETSENCRYPT_EMAIL: ""
+EOF
+
+if command -v docker-compose >/dev/null 2>&1; then
+    NEG_COMPOSE=(docker-compose -f "$NEG_COMPOSE_FILE")
+else
+    NEG_COMPOSE=(docker compose -f "$NEG_COMPOSE_FILE")
+fi
+
+# `up` is expected to fail because the container exits with non-zero. Capture
+# logs and grep for the documented "use the <ver>-php tag" message.
+"${NEG_COMPOSE[@]}" up --abort-on-container-exit --exit-code-from proxy >/dev/null 2>&1 || true
+neg_logs="$("${NEG_COMPOSE[@]}" logs --no-color 2>&1 || true)"
+"${NEG_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+printf '%s\n' "$neg_logs" | grep -q 'STATIC_PHP_SITES is set but this image was built without PHP support' \
+    || { printf 'negative-test FAILED: plain image did not reject STATIC_PHP_SITES with the expected message\n'; printf '%s\n' "$neg_logs"; exit 1; }
+
 printf 'smoke test passed\n'
