@@ -1,6 +1,7 @@
 *~
 \#*\#
 .tmp-smoke.*
+.DS_Store
 .claude/
 CLAUDE.md
-.DS_Store
+ROADMAP.md
