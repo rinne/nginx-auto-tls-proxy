@@ -1,0 +1,8 @@
+.git
+.github
+.tmp-smoke.*
+dc
+tests
+*.md
+ROADMAP.md
+LICENSE

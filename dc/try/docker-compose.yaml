@@ -1,0 +1,36 @@
+services:
+  nginx:
+    image: nginx-auto-tls-proxy:try
+    build:
+      context: ../../nginx-auto-tls-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ssl_certs:/ssl
+      - site_data:/sites
+      - docs_site:/demo/docs
+    environment:
+      STATIC_SITES: "static.localhost,docs.localhost"
+      STATIC_SITE_ROOTS: "docs.localhost:/demo/docs"
+      PROXY_SITES: "app.localhost:http://backend/"
+      SITE_ALIASES: "static.localhost:www.static.localhost"
+      DEFAULT_SITE: "static.localhost"
+      STATIC_FALLBACK_PAGES: "1"
+      LETSENCRYPT_EMAIL: ""
+      DRY_RUN: "0"
+    restart: unless-stopped
+
+  backend:
+    image: nginx:alpine
+    volumes:
+      - backend_html:/usr/share/nginx/html
+    command: >
+      sh -c 'printf "<!doctype html><title>app.localhost</title><h1>Backend app through nginx-auto-tls-proxy</h1><p>If you see this, reverse proxying works.</p>" > /usr/share/nginx/html/index.html
+      && nginx -g "daemon off;"'
+
+volumes:
+  ssl_certs:
+  site_data:
+  docs_site:
+  backend_html:

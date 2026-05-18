@@ -1,0 +1,54 @@
+services:
+  nginx:
+    image: nginx-auto-tls-proxy:local
+    build:
+      context: ../nginx-auto-tls-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ssl_certs:/ssl       # persist TLS certs (self-signed + LE)
+      - site_data:/sites     # persist static site content
+    environment:
+      # Comma-separated hostnames for static file serving
+      STATIC_SITES: "example.local"
+      # Optional domain:absolute-path overrides for selected static site roots
+      STATIC_SITE_ROOTS: ""
+      # Comma-separated domain:upstream-url pairs for reverse proxy
+      # Example: myapp.com:http://app:3000/,api.com:http://api:8080/
+      PROXY_SITES: ""
+      # Aliases: domain.com:www.domain.com,olddomain.com,domain2.com:www.domain2.com
+      SITE_ALIASES: ""
+      # Optional existing primary site for unknown HTTP hostnames; HTTPS unknown SNI is still rejected
+      DEFAULT_SITE: ""
+      # Optional mounted htpasswd files: domain.com:/run/secrets/domain.htpasswd
+      BASIC_AUTH_FILES: ""
+      # Reverse-proxy/body tuning
+      CLIENT_MAX_BODY_SIZE: "16m"
+      PROXY_READ_TIMEOUT: "60s"
+      PROXY_SEND_TIMEOUT: "60s"
+      # Enable only after confirming every hostname should be HTTPS-only
+      HSTS_MAX_AGE: "0"
+      # Optionally generate simple 404.html and 50x.html files for static sites
+      STATIC_FALLBACK_PAGES: "0"
+      # Optional OCSP stapling for real CA certs
+      OCSP_STAPLING: "0"
+      # Trusted proxy support, e.g. REAL_IP_FROM: "172.16.0.0/12"
+      REAL_IP_FROM: ""
+      REAL_IP_HEADER: "X-Forwarded-For"
+      # Set to enable Let's Encrypt certificate management
+      LETSENCRYPT_EMAIL: ""
+      # Set to "1" to temporarily disable LE even when LETSENCRYPT_EMAIL is configured
+      LETSENCRYPT_DISABLE: "0"
+      # Set to "1" to use the LE staging server (for testing)
+      LETSENCRYPT_STAGING: "0"
+      # Renewal loop interval and "renew before" threshold
+      LETSENCRYPT_RENEW_INTERVAL_SECONDS: "43200"
+      LE_RENEW_BEFORE_DAYS: "30"
+      # Validate generated config and exit without starting nginx/certbot
+      DRY_RUN: "0"
+    restart: unless-stopped
+
+volumes:
+  ssl_certs:
+  site_data:
