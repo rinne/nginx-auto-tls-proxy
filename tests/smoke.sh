@@ -87,6 +87,11 @@ curl -fksS --resolve "proxy.local:$HTTPS_PORT:127.0.0.1" \
 "${COMPOSE[@]}" exec -T proxy sh -c \
     "grep -q 'proxy_set_header Upgrade' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf && grep -q 'proxy_set_header Connection' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf"
 
+"${COMPOSE[@]}" exec -T proxy sh -c \
+    "grep -q 'resolver 127.0.0.11 valid=5s' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf \
+     && grep -q 'set \$upstream_proxy_local' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf \
+     && grep -q 'proxy_pass \$upstream_proxy_local' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf"
+
 # --- SITE_REDIRECTS coverage ---
 # Assert that a curl request returns 302 with the expected redirect_url. Uses
 # curl's `-w '%{redirect_url}'` writeout, which is reliable across HTTP/1.1

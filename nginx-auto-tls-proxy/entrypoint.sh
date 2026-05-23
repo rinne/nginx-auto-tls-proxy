@@ -417,6 +417,8 @@ PROXY_SEND_TIMEOUT="${PROXY_SEND_TIMEOUT:-60s}"
 HSTS_MAX_AGE="${HSTS_MAX_AGE:-0}"
 OCSP_STAPLING="${OCSP_STAPLING:-0}"
 STATIC_FALLBACK_PAGES="${STATIC_FALLBACK_PAGES:-0}"
+PROXY_RESOLVER="${PROXY_RESOLVER:-127.0.0.11}"
+PROXY_RESOLVER_VALID="${PROXY_RESOLVER_VALID:-5s}"
 REAL_IP_HEADER="${REAL_IP_HEADER:-X-Forwarded-For}"
 LETSENCRYPT_RENEW_INTERVAL_SECONDS="${LETSENCRYPT_RENEW_INTERVAL_SECONDS:-43200}"
 LE_RENEW_BEFORE_DAYS="${LE_RENEW_BEFORE_DAYS:-30}"
@@ -427,6 +429,10 @@ PHP_MAX_EXECUTION_TIME="${PHP_MAX_EXECUTION_TIME:-30}"
 PHP_FPM_PROFILE_RAW="${PHP_FPM_PROFILE:-M}"
 PHP_FPM_PROFILE="$(upper "$(trim_spaces "$PHP_FPM_PROFILE_RAW")")"
 
+if [[ "$PROXY_RESOLVER" != "default" ]]; then
+    [[ "$PROXY_RESOLVER" =~ ^[A-Za-z0-9.:]+$ ]] || die "PROXY_RESOLVER must be an IP/hostname or 'default'; got: $PROXY_RESOLVER"
+    is_safe_duration "$PROXY_RESOLVER_VALID" || die "PROXY_RESOLVER_VALID must look like 5s, 10s, or 30s; got: $PROXY_RESOLVER_VALID"
+fi
 is_safe_size "$CLIENT_MAX_BODY_SIZE" || die "CLIENT_MAX_BODY_SIZE must look like 16m, 512k, or 1g"
 is_safe_duration "$PROXY_READ_TIMEOUT" || die "PROXY_READ_TIMEOUT must look like 60s, 5m, or 1h"
 is_safe_duration "$PROXY_SEND_TIMEOUT" || die "PROXY_SEND_TIMEOUT must look like 60s, 5m, or 1h"
@@ -624,6 +630,17 @@ NGINXEOF
 
     if [[ "$mode" == "proxy" ]]; then
         local proxy_url="${PROXY_MAP["$site"]}"
+        local var_slug="${site//[^a-zA-Z0-9]/_}"
+        local resolver_lines=""
+        local proxy_pass_lines=""
+        if [[ "$PROXY_RESOLVER" != "default" ]]; then
+            resolver_lines="        resolver $PROXY_RESOLVER valid=$PROXY_RESOLVER_VALID;
+        resolver_timeout 3s;"
+            proxy_pass_lines="        set \$upstream_${var_slug} $proxy_url;
+        proxy_pass \$upstream_${var_slug};"
+        else
+            proxy_pass_lines="        proxy_pass $proxy_url;"
+        fi
         cat >> "$conf" <<NGINXEOF
 server {
     listen 443 ssl;
@@ -639,7 +656,8 @@ $(nginx_hsts_line)
 
     location / {
 $(nginx_auth_lines "$site")
-        proxy_pass $proxy_url;
+$resolver_lines
+$proxy_pass_lines
         proxy_http_version 1.1;
         proxy_set_header Host              \$http_host;
         proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
