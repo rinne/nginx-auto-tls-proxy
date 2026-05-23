@@ -146,6 +146,52 @@ curl -fsS -H 'Host: shallow.local' \
 # over container names / ports.
 "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 
+# --- HTTPS_PORT_OVERRIDE config generation (DRY_RUN) ---
+PORT_IMG="$("${COMPOSE[@]}" images -q proxy 2>/dev/null || docker images -q tmp-smoke*-proxy 2>/dev/null | head -1)"
+# Use the already-built image for DRY_RUN config checks.
+port_check() {
+    docker run --rm \
+        -e STATIC_SITES="normal.local,alt.local" \
+        -e PROXY_SITES="proxy.local:http://backend:3000/" \
+        -e SITE_REDIRECTS="redir.local:alt.local" \
+        -e HTTPS_PORT_OVERRIDE="alt.local:4444,proxy.local:5555,redir.local:6666" \
+        -e DRY_RUN=1 \
+        --entrypoint bash "$PORT_IMG" -c "$1"
+}
+
+port_check '
+/entrypoint.sh >/dev/null 2>&1
+grep -q "listen 443 ssl" /etc/nginx/conf.d/nginx-auto-tls-proxy-normal.local.conf \
+    || { echo "FAIL: normal.local should listen on 443"; exit 1; }
+grep -q "listen 4444 ssl" /etc/nginx/conf.d/nginx-auto-tls-proxy-alt.local.conf \
+    || { echo "FAIL: alt.local should listen on 4444"; exit 1; }
+grep -q "listen 5555 ssl" /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf \
+    || { echo "FAIL: proxy.local should listen on 5555"; exit 1; }
+grep -q "listen 6666 ssl" /etc/nginx/conf.d/nginx-auto-tls-proxy-redir.local.conf \
+    || { echo "FAIL: redir.local should listen on 6666"; exit 1; }
+grep -q "return 302 https://normal.local\$request_uri" /etc/nginx/conf.d/nginx-auto-tls-proxy-normal.local.conf \
+    || { echo "FAIL: normal.local HTTP redirect should not include port"; exit 1; }
+grep -q "return 302 https://alt.local:4444\$request_uri" /etc/nginx/conf.d/nginx-auto-tls-proxy-alt.local.conf \
+    || { echo "FAIL: alt.local HTTP redirect should include :4444"; exit 1; }
+grep -q "return 302 https://alt.local:4444/" /etc/nginx/conf.d/nginx-auto-tls-proxy-redir.local.conf \
+    || { echo "FAIL: redir.local should redirect to alt.local:4444"; exit 1; }
+grep -q "listen 443 ssl default_server" /etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf \
+    || { echo "FAIL: 443 default_server should exist when a site uses 443"; exit 1; }
+! grep -q "listen 443 ssl" /etc/nginx/conf.d/nginx-auto-tls-proxy-alt.local.conf \
+    || { echo "FAIL: alt.local should NOT listen on 443"; exit 1; }
+'
+
+# All sites on custom ports — no 443 catch-all.
+docker run --rm \
+    -e STATIC_SITES="a.local" \
+    -e HTTPS_PORT_OVERRIDE="a.local:4444" \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh >/dev/null 2>&1
+! grep -q "listen 443" /etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf \
+    || { echo "FAIL: 443 catch-all should be omitted when no site uses 443"; exit 1; }
+'
+
 # --- Negative: plain image must reject STATIC_PHP_SITES with a clear error. ---
 NEG_COMPOSE_FILE="$TMP_DIR/docker-compose-php-negative.yaml"
 cat > "$NEG_COMPOSE_FILE" <<EOF

@@ -118,6 +118,16 @@ is_valid_redirect_mode() {
     [[ "$1" == "deep" || "$1" == "no-deep" ]]
 }
 
+site_https_port() {
+    local site="$1"
+    if [[ "${SERVER_NAME_OWNER["$site"]+isset}" == "isset" ]]; then
+        local primary="${SERVER_NAME_OWNER["$site"]}"
+        printf '%s' "${SITE_HTTPS_PORT["$primary"]:-443}"
+    else
+        printf '443'
+    fi
+}
+
 nginx_auth_lines() {
     local site="$1"
     [[ "${BASIC_AUTH_MAP["$site"]+isset}" == "isset" ]] || return 0
@@ -224,6 +234,8 @@ declare -A STATIC_ROOT_MAP=()
 declare -A ALL_SITE_MAP=()
 declare -A SERVER_NAME_OWNER=()
 declare -A BASIC_AUTH_MAP=()
+declare -A HTTPS_PORT_MAP=()
+declare -A SITE_HTTPS_PORT=()
 declare -a STATIC_SITES_ARR=()
 declare -a STATIC_PHP_SITES_ARR=()
 declare -a PROXY_SITES_ARR=()
@@ -411,6 +423,36 @@ if [[ -n "$DEFAULT_SITE" ]]; then
     site_exists "$DEFAULT_SITE" || die "DEFAULT_SITE must match a configured primary site: $DEFAULT_SITE"
 fi
 
+# HTTPS port overrides: HTTPS_PORT_OVERRIDE=host:port,...
+if [[ -n "${HTTPS_PORT_OVERRIDE:-}" ]]; then
+    IFS=',' read -ra _parts <<< "$HTTPS_PORT_OVERRIDE"
+    for _p in "${_parts[@]}"; do
+        _p="$(trim_spaces "$_p")"
+        [[ -z "$_p" ]] && continue
+        [[ "$_p" == *:* ]] || die "Malformed HTTPS_PORT_OVERRIDE entry, expected host:port: $_p"
+        _host="$(lower "$(trim_spaces "${_p%%:*}")")"
+        _port="$(trim_spaces "${_p#*:}")"
+        require_hostname "$_host" "HTTPS_PORT_OVERRIDE"
+        is_positive_int "$_port" || die "HTTPS_PORT_OVERRIDE port must be a positive integer: $_port"
+        [[ "$_port" -le 65535 ]] || die "HTTPS_PORT_OVERRIDE port must be 1-65535: $_port"
+        [[ "$_port" -eq 80 ]] && die "HTTPS_PORT_OVERRIDE port 80 is forbidden (reserved for HTTP): $_host:$_port"
+        [[ "${SERVER_NAME_OWNER["$_host"]+isset}" == "isset" ]] \
+            || die "HTTPS_PORT_OVERRIDE host must be a configured site or alias: $_host"
+        [[ "${HTTPS_PORT_MAP["$_host"]+isset}" == "isset" ]] && die "Duplicate HTTPS_PORT_OVERRIDE entry: $_host"
+        HTTPS_PORT_MAP["$_host"]="$_port"
+    done
+    for _host in "${!HTTPS_PORT_MAP[@]}"; do
+        _port="${HTTPS_PORT_MAP["$_host"]}"
+        _primary="${SERVER_NAME_OWNER["$_host"]}"
+        if [[ "${SITE_HTTPS_PORT["$_primary"]+isset}" == "isset" ]]; then
+            [[ "${SITE_HTTPS_PORT["$_primary"]}" == "$_port" ]] \
+                || die "Conflicting HTTPS_PORT_OVERRIDE ports for server block $_primary: ${SITE_HTTPS_PORT["$_primary"]} vs $_port (from $_host)"
+        else
+            SITE_HTTPS_PORT["$_primary"]="$_port"
+        fi
+    done
+fi
+
 CLIENT_MAX_BODY_SIZE="${CLIENT_MAX_BODY_SIZE:-16m}"
 PROXY_READ_TIMEOUT="${PROXY_READ_TIMEOUT:-60s}"
 PROXY_SEND_TIMEOUT="${PROXY_SEND_TIMEOUT:-60s}"
@@ -566,6 +608,8 @@ generate_site_config() {
     local alias
     local mode
     mode="$(site_mode "$site")"
+    local site_port
+    site_port="$(site_https_port "$site")"
 
     for alias in $(site_aliases "$site"); do
         server_names="$server_names $alias"
@@ -579,13 +623,18 @@ generate_site_config() {
     if [[ "$mode" == "redirect" ]]; then
         local _dst_host="${REDIRECT_MAP["$site"]}"
         local _dst_mode="${REDIRECT_MODE_MAP["$site"]}"
+        local _dst_port _dst_port_suffix=""
+        _dst_port="$(site_https_port "$_dst_host")"
+        [[ "$_dst_port" != "443" ]] && _dst_port_suffix=":${_dst_port}"
         if [[ "$_dst_mode" == "deep" ]]; then
-            http_redirect_target="https://${_dst_host}\$request_uri"
+            http_redirect_target="https://${_dst_host}${_dst_port_suffix}\$request_uri"
         else
-            http_redirect_target="https://${_dst_host}/"
+            http_redirect_target="https://${_dst_host}${_dst_port_suffix}/"
         fi
     else
-        http_redirect_target="https://${site}\$request_uri"
+        local _port_suffix=""
+        [[ "$site_port" != "443" ]] && _port_suffix=":${site_port}"
+        http_redirect_target="https://${site}${_port_suffix}\$request_uri"
     fi
 
     cat > "$conf" <<NGINXEOF
@@ -608,7 +657,7 @@ NGINXEOF
     if [[ "$mode" == "redirect" ]]; then
         cat >> "$conf" <<NGINXEOF
 server {
-    listen 443 ssl;
+    listen $site_port ssl;
     http2 on;
     server_name $server_names;
 
@@ -643,7 +692,7 @@ NGINXEOF
         fi
         cat >> "$conf" <<NGINXEOF
 server {
-    listen 443 ssl;
+    listen $site_port ssl;
     http2 on;
     server_name $server_names;
 
@@ -675,7 +724,7 @@ NGINXEOF
         site_root="$(site_static_root "$site")"
         cat >> "$conf" <<NGINXEOF
 server {
-    listen 443 ssl;
+    listen $site_port ssl;
     http2 on;
     server_name $server_names;
 
@@ -719,7 +768,7 @@ NGINXEOF
         site_root="$(site_static_root "$site")"
         cat >> "$conf" <<NGINXEOF
 server {
-    listen 443 ssl;
+    listen $site_port ssl;
     http2 on;
     server_name $server_names;
 
@@ -763,7 +812,10 @@ print_startup_summary() {
             *)
                 target="$(site_static_root "$site")" ;;
         esac
-        log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")"
+        local _port_info=""
+        local _sp; _sp="$(site_https_port "$site")"
+        [[ "$_sp" != "443" ]] && _port_info=" port=$_sp"
+        log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")${_port_info}"
     done
 }
 
@@ -865,8 +917,11 @@ server {
 NGINXEOF
 
 if [[ -n "$DEFAULT_SITE" ]]; then
+    _ds_port="$(site_https_port "$DEFAULT_SITE")"
+    _ds_port_suffix=""
+    [[ "$_ds_port" != "443" ]] && _ds_port_suffix=":${_ds_port}"
     cat >> /etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf <<NGINXEOF
-        return 302 https://$DEFAULT_SITE\$request_uri;
+        return 302 https://${DEFAULT_SITE}${_ds_port_suffix}\$request_uri;
 NGINXEOF
 else
     cat >> /etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf <<'NGINXEOF'
@@ -877,6 +932,14 @@ fi
 cat >> /etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf <<'NGINXEOF'
     }
 }
+NGINXEOF
+
+_has_port_443=0
+for _site in "${ALL_SITES[@]}"; do
+    [[ "$(site_https_port "$_site")" == "443" ]] && { _has_port_443=1; break; }
+done
+if [[ "$_has_port_443" == "1" || ${#ALL_SITES[@]} -eq 0 ]]; then
+    cat >> /etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf <<'NGINXEOF'
 
 server {
     listen 443 ssl default_server;
@@ -884,6 +947,7 @@ server {
     ssl_reject_handshake on;
 }
 NGINXEOF
+fi
 
 generate_real_ip_config
 
