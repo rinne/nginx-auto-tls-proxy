@@ -68,7 +68,8 @@ RUN mkdir -p \
     /ssl \
     /sites \
     /etc/nginx/conf.d \
-    /etc/nginx/site-conf.d
+    /etc/nginx/site-conf.d \
+    /etc/nginx/stream.d
 
 COPY nginx.conf        /etc/nginx/nginx.conf
 COPY entrypoint.sh     /entrypoint.sh

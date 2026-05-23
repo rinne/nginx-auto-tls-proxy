@@ -109,6 +109,8 @@ site_mode() {
         printf 'static-php'
     elif [[ "${REDIRECT_MAP["$site"]+isset}" == "isset" ]]; then
         printf 'redirect'
+    elif [[ "${TLS_TERM_MAP["$site"]+isset}" == "isset" ]]; then
+        printf 'tls-terminator'
     else
         printf 'static'
     fi
@@ -120,8 +122,16 @@ is_valid_redirect_mode() {
 
 site_https_port() {
     local site="$1"
+    if [[ "${TLS_TERM_PORT_MAP["$site"]+isset}" == "isset" ]]; then
+        printf '%s' "${TLS_TERM_PORT_MAP["$site"]}"
+        return
+    fi
     if [[ "${SERVER_NAME_OWNER["$site"]+isset}" == "isset" ]]; then
         local primary="${SERVER_NAME_OWNER["$site"]}"
+        if [[ "${TLS_TERM_PORT_MAP["$primary"]+isset}" == "isset" ]]; then
+            printf '%s' "${TLS_TERM_PORT_MAP["$primary"]}"
+            return
+        fi
         printf '%s' "${SITE_HTTPS_PORT["$primary"]:-443}"
     else
         printf '443'
@@ -236,10 +246,14 @@ declare -A SERVER_NAME_OWNER=()
 declare -A BASIC_AUTH_MAP=()
 declare -A HTTPS_PORT_MAP=()
 declare -A SITE_HTTPS_PORT=()
+declare -A TLS_TERM_MAP=()
+declare -A TLS_TERM_PORT_MAP=()
+declare -A TLS_TERM_PP_MAP=()
 declare -a STATIC_SITES_ARR=()
 declare -a STATIC_PHP_SITES_ARR=()
 declare -a PROXY_SITES_ARR=()
 declare -a REDIRECT_SITES_ARR=()
+declare -a TLS_TERM_SITES_ARR=()
 declare -a ALL_SITES=()
 
 # Static sites: STATIC_SITES=domain.com,domain2.com
@@ -335,6 +349,46 @@ if [[ -n "${SITE_REDIRECTS:-}" ]]; then
     done
 fi
 
+# TLS terminator proxy: TLS_TERMINATOR_PROXY=host:port:backend_host:backend_port[:proxy_protocol]
+if [[ -n "${TLS_TERMINATOR_PROXY:-}" ]]; then
+    IFS=',' read -ra _parts <<< "$TLS_TERMINATOR_PROXY"
+    for _p in "${_parts[@]}"; do
+        _p="$(trim_spaces "$_p")"
+        [[ -z "$_p" ]] && continue
+        IFS=':' read -ra _fields <<< "$_p"
+        if [[ ${#_fields[@]} -lt 4 || ${#_fields[@]} -gt 5 ]]; then
+            die "Malformed TLS_TERMINATOR_PROXY entry, expected host:port:backend_host:backend_port[:proxy_protocol]: $_p"
+        fi
+        _site="$(lower "$(trim_spaces "${_fields[0]}")")"
+        _listen_port="$(trim_spaces "${_fields[1]}")"
+        _backend_host="$(trim_spaces "${_fields[2]}")"
+        _backend_port="$(trim_spaces "${_fields[3]}")"
+        _pp=""
+        if [[ ${#_fields[@]} -eq 5 ]]; then
+            _pp="$(lower "$(trim_spaces "${_fields[4]}")")"
+            [[ "$_pp" == "proxy_protocol" ]] || die "TLS_TERMINATOR_PROXY 5th field must be 'proxy_protocol'; got: $_pp (in $_p)"
+        fi
+        require_hostname "$_site" "TLS_TERMINATOR_PROXY"
+        [[ "$_backend_host" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid backend host in TLS_TERMINATOR_PROXY: $_backend_host"
+        is_positive_int "$_listen_port" || die "TLS_TERMINATOR_PROXY listen port must be a positive integer: $_listen_port"
+        [[ "$_listen_port" -le 65535 ]] || die "TLS_TERMINATOR_PROXY listen port must be 1-65535: $_listen_port"
+        [[ "$_listen_port" -eq 80 ]] && die "TLS_TERMINATOR_PROXY listen port 80 is forbidden (reserved for HTTP): $_p"
+        is_positive_int "$_backend_port" || die "TLS_TERMINATOR_PROXY backend port must be a positive integer: $_backend_port"
+        [[ "$_backend_port" -le 65535 ]] || die "TLS_TERMINATOR_PROXY backend port must be 1-65535: $_backend_port"
+        [[ "${STATIC_SITE_MAP["$_site"]+isset}" == "isset" ]]     && die "$_site is configured in both STATIC_SITES and TLS_TERMINATOR_PROXY"
+        [[ "${STATIC_PHP_SITE_MAP["$_site"]+isset}" == "isset" ]] && die "$_site is configured in both STATIC_PHP_SITES and TLS_TERMINATOR_PROXY"
+        [[ "${PROXY_MAP["$_site"]+isset}" == "isset" ]]           && die "$_site is configured in both PROXY_SITES and TLS_TERMINATOR_PROXY"
+        [[ "${REDIRECT_MAP["$_site"]+isset}" == "isset" ]]        && die "$_site is configured in both SITE_REDIRECTS and TLS_TERMINATOR_PROXY"
+        [[ "${TLS_TERM_MAP["$_site"]+isset}" == "isset" ]]        && die "Duplicate TLS_TERMINATOR_PROXY frontend host: $_site"
+        TLS_TERM_MAP["$_site"]="${_backend_host}:${_backend_port}"
+        TLS_TERM_PORT_MAP["$_site"]="$_listen_port"
+        [[ -n "$_pp" ]] && TLS_TERM_PP_MAP["$_site"]=1
+        TLS_TERM_SITES_ARR+=("$_site")
+        ALL_SITE_MAP["$_site"]=1
+        ALL_SITES+=("$_site")
+    done
+fi
+
 # Aliases: SITE_ALIASES=domain.com:www.domain.com,old.example.com,domain2.com:www.domain2.com
 if [[ -n "${SITE_ALIASES:-}" ]]; then
     _current_site=""
@@ -392,6 +446,7 @@ if [[ -n "${BASIC_AUTH_FILES:-}" ]]; then
         require_hostname "$_site" "BASIC_AUTH_FILES"
         require_safe_path "$_file" "BASIC_AUTH_FILES path for $_site"
         site_exists "$_site" || die "BASIC_AUTH_FILES entry for $_site has no matching site"
+        [[ "${TLS_TERM_MAP["$_site"]+isset}" == "isset" ]] && die "BASIC_AUTH_FILES cannot be used with TLS_TERMINATOR_PROXY site: $_site (no HTTP layer)"
         BASIC_AUTH_MAP["$_site"]="$_file"
     done
 fi
@@ -421,6 +476,7 @@ done
 DEFAULT_SITE="$(lower "$(trim_spaces "${DEFAULT_SITE:-}")")"
 if [[ -n "$DEFAULT_SITE" ]]; then
     site_exists "$DEFAULT_SITE" || die "DEFAULT_SITE must match a configured primary site: $DEFAULT_SITE"
+    [[ "${TLS_TERM_MAP["$DEFAULT_SITE"]+isset}" == "isset" ]] && die "DEFAULT_SITE cannot be a TLS_TERMINATOR_PROXY site: $DEFAULT_SITE"
 fi
 
 # HTTPS port overrides: HTTPS_PORT_OVERRIDE=host:port,...
@@ -438,6 +494,9 @@ if [[ -n "${HTTPS_PORT_OVERRIDE:-}" ]]; then
         [[ "$_port" -eq 80 ]] && die "HTTPS_PORT_OVERRIDE port 80 is forbidden (reserved for HTTP): $_host:$_port"
         [[ "${SERVER_NAME_OWNER["$_host"]+isset}" == "isset" ]] \
             || die "HTTPS_PORT_OVERRIDE host must be a configured site or alias: $_host"
+        _hp_primary="${SERVER_NAME_OWNER["$_host"]}"
+        [[ "${TLS_TERM_MAP["$_hp_primary"]+isset}" == "isset" ]] \
+            && die "HTTPS_PORT_OVERRIDE cannot be used with TLS_TERMINATOR_PROXY site $_hp_primary (host: $_host)"
         [[ "${HTTPS_PORT_MAP["$_host"]+isset}" == "isset" ]] && die "Duplicate HTTPS_PORT_OVERRIDE entry: $_host"
         HTTPS_PORT_MAP["$_host"]="$_port"
     done
@@ -451,6 +510,33 @@ if [[ -n "${HTTPS_PORT_OVERRIDE:-}" ]]; then
             SITE_HTTPS_PORT["$_primary"]="$_port"
         fi
     done
+fi
+
+# Validate TLS terminator port uniqueness and conflicts.
+if [[ ${#TLS_TERM_SITES_ARR[@]} -gt 0 ]]; then
+    declare -A _tls_term_ports_seen=()
+    for _site in "${TLS_TERM_SITES_ARR[@]}"; do
+        _port="${TLS_TERM_PORT_MAP["$_site"]}"
+        if [[ "${_tls_term_ports_seen["$_port"]+isset}" == "isset" ]]; then
+            die "TLS_TERMINATOR_PROXY listen port $_port is used by both ${_tls_term_ports_seen["$_port"]} and $_site (stream cannot share ports via SNI)"
+        fi
+        _tls_term_ports_seen["$_port"]="$_site"
+        for _hp in "${!SITE_HTTPS_PORT[@]}"; do
+            if [[ "${SITE_HTTPS_PORT["$_hp"]}" == "$_port" ]]; then
+                die "TLS_TERMINATOR_PROXY listen port $_port ($_site) conflicts with HTTPS_PORT_OVERRIDE port on $_hp"
+            fi
+        done
+        if [[ "$_port" == "443" ]]; then
+            for _s in "${ALL_SITES[@]}"; do
+                [[ "${TLS_TERM_MAP["$_s"]+isset}" == "isset" ]] && continue
+                _sp="$(site_https_port "$_s")"
+                if [[ "$_sp" == "443" ]]; then
+                    die "TLS_TERMINATOR_PROXY listen port 443 ($_site) conflicts with site $_s on port 443"
+                fi
+            done
+        fi
+    done
+    unset _tls_term_ports_seen
 fi
 
 CLIENT_MAX_BODY_SIZE="${CLIENT_MAX_BODY_SIZE:-16m}"
@@ -601,6 +687,62 @@ real_ip_recursive on;
 EOF
 }
 
+generate_stream_config() {
+    local site="$1"
+    local conf="/etc/nginx/stream.d/nginx-auto-tls-proxy-${site}.conf"
+    local listen_port="${TLS_TERM_PORT_MAP["$site"]}"
+    local backend="${TLS_TERM_MAP["$site"]}"
+    local var_slug="${site//[^a-zA-Z0-9]/_}"
+
+    local resolver_lines=""
+    local proxy_pass_line=""
+    if [[ "$PROXY_RESOLVER" != "default" ]]; then
+        resolver_lines="    resolver $PROXY_RESOLVER valid=$PROXY_RESOLVER_VALID;
+    resolver_timeout 3s;"
+        proxy_pass_line="    set \$backend_${var_slug} $backend;
+    proxy_pass \$backend_${var_slug};"
+    else
+        if [[ "${OCSP_STAPLING:-0}" == "1" ]]; then
+            resolver_lines="    resolver 1.1.1.1 1.0.0.1 valid=300s;
+    resolver_timeout 5s;"
+        fi
+        proxy_pass_line="    proxy_pass $backend;"
+    fi
+
+    local pp_line=""
+    [[ "${TLS_TERM_PP_MAP["$site"]+isset}" == "isset" ]] && pp_line="    proxy_protocol on;"
+
+    local ocsp_lines=""
+    if [[ "${OCSP_STAPLING:-0}" == "1" ]]; then
+        ocsp_lines="    ssl_trusted_certificate /ssl/$site/chain.crt;
+    ssl_stapling on;
+    ssl_stapling_verify on;"
+    fi
+
+    cat > "$conf" <<NGINXEOF
+server {
+    listen $listen_port ssl;
+    ssl_certificate     /ssl/$site/ssl.crt;
+    ssl_certificate_key /ssl/$site/ssl.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+    ssl_session_cache shared:STREAM_SSL_${var_slug}:1m;
+    ssl_session_timeout 10m;
+    ssl_session_tickets off;
+$ocsp_lines
+
+$resolver_lines
+$proxy_pass_line
+$pp_line
+    proxy_timeout $PROXY_READ_TIMEOUT;
+    proxy_connect_timeout $PROXY_SEND_TIMEOUT;
+}
+NGINXEOF
+
+    log "Stream config written for $site (port=$listen_port backend=$backend)"
+}
+
 generate_site_config() {
     local site="$1"
     local conf="/etc/nginx/conf.d/nginx-auto-tls-proxy-${site}.conf"
@@ -653,6 +795,11 @@ server {
 }
 
 NGINXEOF
+
+    if [[ "$mode" == "tls-terminator" ]]; then
+        log "Config written for $site (mode=tls-terminator, HTTP-only for ACME/redirect)"
+        return
+    fi
 
     if [[ "$mode" == "redirect" ]]; then
         cat >> "$conf" <<NGINXEOF
@@ -809,12 +956,18 @@ print_startup_summary() {
                 target="${PROXY_MAP["$site"]}" ;;
             redirect)
                 target="https://${REDIRECT_MAP["$site"]} (${REDIRECT_MODE_MAP["$site"]})" ;;
+            tls-terminator)
+                target="${TLS_TERM_MAP["$site"]} (stream/L4)" ;;
             *)
                 target="$(site_static_root "$site")" ;;
         esac
         local _port_info=""
         local _sp; _sp="$(site_https_port "$site")"
         [[ "$_sp" != "443" ]] && _port_info=" port=$_sp"
+        if [[ "$mode" == "tls-terminator" ]]; then
+            _port_info=" stream-port=${TLS_TERM_PORT_MAP["$site"]}"
+            [[ "${TLS_TERM_PP_MAP["$site"]+isset}" == "isset" ]] && _port_info="$_port_info proxy_protocol=on"
+        fi
         log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")${_port_info}"
     done
 }
@@ -902,6 +1055,8 @@ FPMEOF
 
 # Remove only configs generated by this image. Mounted custom snippets are left alone.
 rm -f /etc/nginx/conf.d/nginx-auto-tls-proxy-*.conf
+rm -f /etc/nginx/stream.d/nginx-auto-tls-proxy-*.conf
+mkdir -p /etc/nginx/stream.d
 
 cat > /etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf <<NGINXEOF
 server {
@@ -936,6 +1091,7 @@ NGINXEOF
 
 _has_port_443=0
 for _site in "${ALL_SITES[@]}"; do
+    [[ "${TLS_TERM_MAP["$_site"]+isset}" == "isset" ]] && continue
     [[ "$(site_https_port "$_site")" == "443" ]] && { _has_port_443=1; break; }
 done
 if [[ "$_has_port_443" == "1" || ${#ALL_SITES[@]} -eq 0 ]]; then
@@ -958,6 +1114,10 @@ if [[ ${#ALL_SITES[@]} -gt 0 ]]; then
 else
     log "No sites configured."
 fi
+
+for _site in "${TLS_TERM_SITES_ARR[@]}"; do
+    generate_stream_config "$_site"
+done
 
 render_php_runtime_config
 print_startup_summary

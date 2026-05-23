@@ -192,6 +192,51 @@ docker run --rm \
     || { echo "FAIL: 443 catch-all should be omitted when no site uses 443"; exit 1; }
 '
 
+# --- TLS_TERMINATOR_PROXY config generation (DRY_RUN) ---
+# Basic stream config: correct listen port, variable proxy_pass, HTTP ACME block, no HTTPS in conf.d
+docker run --rm \
+    -e STATIC_SITES="normal.local" \
+    -e TLS_TERMINATOR_PROXY="stream.local:4343:backend:8080,stream2.local:5555:backend2:9090:proxy_protocol" \
+    -e SITE_ALIASES="stream.local:www.stream.local" \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh >/dev/null 2>&1
+grep -q "listen 4343 ssl" /etc/nginx/stream.d/nginx-auto-tls-proxy-stream.local.conf \
+    || { echo "FAIL: stream.local should listen on 4343 in stream.d"; exit 1; }
+grep -q "proxy_pass \$backend_stream_local" /etc/nginx/stream.d/nginx-auto-tls-proxy-stream.local.conf \
+    || { echo "FAIL: stream.local should use variable proxy_pass"; exit 1; }
+grep -q "ssl_protocols" /etc/nginx/stream.d/nginx-auto-tls-proxy-stream.local.conf \
+    || { echo "FAIL: stream config should include ssl_protocols"; exit 1; }
+grep -q "listen 80" /etc/nginx/conf.d/nginx-auto-tls-proxy-stream.local.conf \
+    || { echo "FAIL: stream.local should have HTTP block for ACME"; exit 1; }
+grep -q "return 302 https://stream.local:4343\$request_uri" /etc/nginx/conf.d/nginx-auto-tls-proxy-stream.local.conf \
+    || { echo "FAIL: stream.local HTTP redirect should include :4343"; exit 1; }
+grep -q "server_name stream.local www.stream.local" /etc/nginx/conf.d/nginx-auto-tls-proxy-stream.local.conf \
+    || { echo "FAIL: stream.local HTTP block should include alias"; exit 1; }
+! grep -q "listen 4343 ssl" /etc/nginx/conf.d/nginx-auto-tls-proxy-stream.local.conf \
+    || { echo "FAIL: stream.local should NOT have HTTPS block in conf.d"; exit 1; }
+grep -q "proxy_protocol on" /etc/nginx/stream.d/nginx-auto-tls-proxy-stream2.local.conf \
+    || { echo "FAIL: stream2.local should have proxy_protocol on"; exit 1; }
+'
+
+# Duplicate stream port rejection
+docker run --rm \
+    -e TLS_TERMINATOR_PROXY="a.local:4343:b1:80,b.local:4343:b2:80" \
+    -e DRY_RUN=1 \
+    "$PORT_IMG" 2>&1 \
+    | grep -q 'stream cannot share ports via SNI' \
+    || { printf 'FAIL: should reject duplicate stream ports\n'; exit 1; }
+
+# Port conflict with HTTPS_PORT_OVERRIDE
+docker run --rm \
+    -e STATIC_SITES="a.local" \
+    -e HTTPS_PORT_OVERRIDE="a.local:4444" \
+    -e TLS_TERMINATOR_PROXY="b.local:4444:bg:80" \
+    -e DRY_RUN=1 \
+    "$PORT_IMG" 2>&1 \
+    | grep -q 'conflicts with HTTPS_PORT_OVERRIDE' \
+    || { printf 'FAIL: should reject stream port conflicting with HTTPS_PORT_OVERRIDE\n'; exit 1; }
+
 # --- Negative: plain image must reject STATIC_PHP_SITES with a clear error. ---
 NEG_COMPOSE_FILE="$TMP_DIR/docker-compose-php-negative.yaml"
 cat > "$NEG_COMPOSE_FILE" <<EOF
