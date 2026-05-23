@@ -142,13 +142,14 @@ curl -fsS -H 'Host: shallow.local' \
     | grep -q 'challenge-shallow' \
     || { printf 'FAIL: ACME challenge passthrough broken on redirect source shallow.local\n'; exit 1; }
 
+# Capture the built image ID before tearing down (compose state is lost after down).
+PORT_IMG="$("${COMPOSE[@]}" images -q proxy 2>/dev/null | head -1)"
+
 # Tear down the main stack before the negative-test substack, so we don't fight
 # over container names / ports.
 "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 
 # --- HTTPS_PORT_OVERRIDE config generation (DRY_RUN) ---
-PORT_IMG="$("${COMPOSE[@]}" images -q proxy 2>/dev/null || docker images -q tmp-smoke*-proxy 2>/dev/null | head -1)"
-# Use the already-built image for DRY_RUN config checks.
 port_check() {
     docker run --rm \
         -e STATIC_SITES="normal.local,alt.local" \
