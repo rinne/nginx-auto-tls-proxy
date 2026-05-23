@@ -224,8 +224,10 @@ grep -q "proxy_protocol on" /etc/nginx/stream.d/nginx-auto-tls-proxy-stream2.loc
 docker run --rm \
     -e TLS_TERMINATOR_PROXY="a.local:4343:b1:80,b.local:4343:b2:80" \
     -e DRY_RUN=1 \
-    "$PORT_IMG" 2>&1 \
-    | grep -q 'stream cannot share ports via SNI' \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected duplicate stream ports"; exit 1; }
+true
+' | grep -q 'stream cannot share ports via SNI' \
     || { printf 'FAIL: should reject duplicate stream ports\n'; exit 1; }
 
 # Port conflict with HTTPS_PORT_OVERRIDE
@@ -234,8 +236,10 @@ docker run --rm \
     -e HTTPS_PORT_OVERRIDE="a.local:4444" \
     -e TLS_TERMINATOR_PROXY="b.local:4444:bg:80" \
     -e DRY_RUN=1 \
-    "$PORT_IMG" 2>&1 \
-    | grep -q 'conflicts with HTTPS_PORT_OVERRIDE' \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected conflicting ports"; exit 1; }
+true
+' | grep -q 'conflicts with HTTPS_PORT_OVERRIDE' \
     || { printf 'FAIL: should reject stream port conflicting with HTTPS_PORT_OVERRIDE\n'; exit 1; }
 
 # --- Negative: plain image must reject STATIC_PHP_SITES with a clear error. ---
