@@ -830,10 +830,11 @@ NGINXEOF
         local resolver_lines=""
         local proxy_pass_lines=""
         if [[ "$PROXY_RESOLVER" != "default" ]]; then
+            local _proxy_var_url="${proxy_url%/}"
             resolver_lines="        resolver $PROXY_RESOLVER valid=$PROXY_RESOLVER_VALID;
         resolver_timeout 3s;"
-            proxy_pass_lines="        set \$upstream_${var_slug} $proxy_url;
-        proxy_pass \$upstream_${var_slug};"
+            proxy_pass_lines="        set \$upstream_${var_slug} ${_proxy_var_url};
+        proxy_pass \$upstream_${var_slug}\$request_uri;"
         else
             proxy_pass_lines="        proxy_pass $proxy_url;"
         fi
