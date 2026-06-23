@@ -38,6 +38,11 @@ PHPEOF
 cat > "$TMP_DIR/php-site/hello.php" <<'PHPEOF'
 <?php echo "hello-from-php"; ?>
 PHPEOF
+# Rewrite target: echoes back the captured ?code= query argument so we can prove
+# an internal rewrite reaches PHP with the rewritten query string intact.
+cat > "$TMP_DIR/php-site/lookup.php" <<'PHPEOF'
+<?php echo "code=" . preg_replace('/[^A-Z0-9-]/', '', $_GET['code'] ?? ''); ?>
+PHPEOF
 
 # Static-site fixture: drop a .php file that MUST NOT be executed.
 cat > "$TMP_DIR/static-site/index.html" <<'HTMLEOF'
@@ -69,6 +74,8 @@ services:
       STATIC_SITE_ROOTS: "custom.local:/custom/custom.local"
       PROXY_SITES: "proxy.local:http://backend/"
       SITE_ALIASES: "default.local:www.default.local,php.local:www.php.local"
+      SITE_REWRITES: |
+        php.local ^/code/([A-Z]{4}-[A-Z]{4})\$ /lookup.php?code=\$1
       LETSENCRYPT_EMAIL: ""
       CLIENT_MAX_BODY_SIZE: "16m"
       PROXY_READ_TIMEOUT: "60s"
@@ -146,6 +153,17 @@ printf '%s\n' "$body" | grep -q '^8\.5$' \
 body="$(curl -fksS --resolve "www.php.local:$HTTPS_PORT:127.0.0.1" "https://www.php.local:$HTTPS_PORT/hello.php")"
 printf '%s\n' "$body" | grep -q 'hello-from-php' \
     || { printf 'FAIL: alias of PHP primary did not serve PHP, got: %s\n' "$body"; exit 1; }
+
+# --- SITE_REWRITES into PHP: pretty URL is rewritten internally to a PHP script. ---
+# The client URL does not change (200, not 302) and the rewritten ?code= query
+# reaches PHP.
+rewrite_code="$(curl -ksS -o /dev/null -w '%{http_code}' \
+    --resolve "php.local:$HTTPS_PORT:127.0.0.1" "https://php.local:$HTTPS_PORT/code/ASDF-YUIO")"
+[[ "$rewrite_code" == "200" ]] \
+    || { printf 'FAIL: PHP internal rewrite returned %s, expected 200\n' "$rewrite_code"; exit 1; }
+body="$(curl -fksS --resolve "php.local:$HTTPS_PORT:127.0.0.1" "https://php.local:$HTTPS_PORT/code/ASDF-YUIO")"
+printf '%s\n' "$body" | grep -q '^code=ASDF-YUIO$' \
+    || { printf 'FAIL: rewrite to PHP did not pass the captured query, got: %s\n' "$body"; exit 1; }
 
 # --- PHP-specific negative: .php under a plain STATIC_SITES entry must NOT execute. ---
 # In strict-routing mode the .php file is matched by `location ~ \.php$` (which

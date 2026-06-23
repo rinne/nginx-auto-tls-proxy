@@ -172,6 +172,14 @@ nginx_static_fallback_lines() {
 EOF
 }
 
+# Server-level internal rewrites for a site (from SITE_REWRITES). Each stored
+# entry is already a fully-quoted `rewrite "<re>" "<repl>" <flag>;` line.
+nginx_rewrite_lines() {
+    local site="$1"
+    [[ "${SITE_REWRITES_MAP["$site"]+isset}" == "isset" ]] || return 0
+    printf '%s' "${SITE_REWRITES_MAP["$site"]}"
+}
+
 # Curated sensitive-path denylist applied to STATIC_PHP_SITES server blocks.
 nginx_php_denylist() {
     cat <<'EOF'
@@ -239,6 +247,7 @@ declare -A STATIC_PHP_SITE_MAP=()
 declare -A PROXY_MAP=()
 declare -A REDIRECT_MAP=()
 declare -A REDIRECT_MODE_MAP=()
+declare -A SITE_REWRITES_MAP=()
 declare -A SITE_ALIASES_MAP=()
 declare -A STATIC_ROOT_MAP=()
 declare -A ALL_SITE_MAP=()
@@ -472,6 +481,46 @@ for _site in "${!SITE_ALIASES_MAP[@]}"; do
     SITE_ALIASES_MAP["$_site"]="$_deduped_aliases"
     unset _alias_seen
 done
+
+# Internal rewrites: SITE_REWRITES is newline-delimited; each line is
+#   <host> <regex> <replacement> [last|break]
+# whitespace-separated (so regex commas/colons and replacement slashes/queries
+# don't collide with a delimiter). Rewrites are applied server-side with no
+# redirect to the client. The replacement must be a path (leading '/') so nginx
+# keeps the rewrite internal; an http(s):// target would silently become a 302.
+# Only static and static-php sites are supported. Rules attach to the owning
+# server block, so a rule may target a primary host or any of its aliases.
+if [[ -n "${SITE_REWRITES:-}" ]]; then
+    while IFS= read -r _line; do
+        _line="$(trim_spaces "$_line")"
+        [[ -z "$_line" ]] && continue
+        read -r _rw_host _rw_pattern _rw_repl _rw_flag _rw_extra <<< "$_line"
+        [[ -z "$_rw_host" || -z "$_rw_pattern" || -z "$_rw_repl" ]] \
+            && die "Malformed SITE_REWRITES line, expected '<host> <regex> <replacement> [last|break]': $_line"
+        [[ -n "$_rw_extra" ]] \
+            && die "Too many fields in SITE_REWRITES line (regex and replacement must not contain whitespace): $_line"
+        _rw_host="$(lower "$_rw_host")"
+        require_hostname "$_rw_host" "SITE_REWRITES"
+        [[ "${SERVER_NAME_OWNER["$_rw_host"]+isset}" == "isset" ]] \
+            || die "SITE_REWRITES host must be a configured site or alias: $_rw_host"
+        _rw_owner="${SERVER_NAME_OWNER["$_rw_host"]}"
+        _rw_mode="$(site_mode "$_rw_owner")"
+        case "$_rw_mode" in
+            static|static-php) ;;
+            *) die "SITE_REWRITES is only valid for static or static-php sites; $_rw_host resolves to $_rw_owner (mode=$_rw_mode)" ;;
+        esac
+        [[ "$_rw_repl" == /* ]] \
+            || die "SITE_REWRITES replacement must be a path starting with '/' (got '$_rw_repl'); use SITE_REDIRECTS for external targets"
+        [[ "$_rw_pattern" == *'"'* || "$_rw_repl" == *'"'* ]] \
+            && die "SITE_REWRITES fields must not contain a double quote: $_line"
+        [[ "$_rw_pattern" == *'\' || "$_rw_repl" == *'\' ]] \
+            && die "SITE_REWRITES fields must not end with a backslash: $_line"
+        _rw_flag="${_rw_flag:-last}"
+        [[ "$_rw_flag" == "last" || "$_rw_flag" == "break" ]] \
+            || die "SITE_REWRITES flag must be 'last' or 'break'; got: $_rw_flag (in $_line)"
+        SITE_REWRITES_MAP["$_rw_owner"]="${SITE_REWRITES_MAP["$_rw_owner"]:-}    rewrite \"$_rw_pattern\" \"$_rw_repl\" $_rw_flag;"$'\n'
+    done <<< "$SITE_REWRITES"
+fi
 
 DEFAULT_SITE="$(lower "$(trim_spaces "${DEFAULT_SITE:-}")")"
 if [[ -n "$DEFAULT_SITE" ]]; then
@@ -888,7 +937,7 @@ $(nginx_hsts_line)
 $(nginx_static_fallback_lines)
 
 $(nginx_php_denylist)
-
+$(nginx_rewrite_lines "$site")
     location / {
 $(nginx_auth_lines "$site")
         try_files \$uri \$uri/ =404;
@@ -930,7 +979,7 @@ $(nginx_hsts_line)
     root "$site_root";
     index index.html index.htm;
 $(nginx_static_fallback_lines)
-
+$(nginx_rewrite_lines "$site")
     location / {
 $(nginx_auth_lines "$site")
         try_files \$uri \$uri/ =404;
@@ -969,7 +1018,11 @@ print_startup_summary() {
             _port_info=" stream-port=${TLS_TERM_PORT_MAP["$site"]}"
             [[ "${TLS_TERM_PP_MAP["$site"]+isset}" == "isset" ]] && _port_info="$_port_info proxy_protocol=on"
         fi
-        log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")${_port_info}"
+        local _rw_info=""
+        if [[ "${SITE_REWRITES_MAP["$site"]+isset}" == "isset" ]]; then
+            _rw_info=" rewrites=$(grep -c . <<< "${SITE_REWRITES_MAP["$site"]}")"
+        fi
+        log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")${_port_info}${_rw_info}"
     done
 }
 

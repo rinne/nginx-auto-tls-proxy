@@ -100,6 +100,7 @@ docker compose -f dc/try/docker-compose.yaml down -v
 | `STATIC_SITE_ROOTS` | `docs.example.com:/htdocs/docs` | Optional `domain:absolute-path` overrides for selected static site roots (works for both `STATIC_SITES` and `STATIC_PHP_SITES`). |
 | `PROXY_SITES` | `app.example.com:http://app:3000/` | Comma-separated `domain:upstream-url` reverse proxy mappings. |
 | `SITE_REDIRECTS` | `old.example.com:example.com,api2.example.com:api.example.com:deep` | Comma-separated `source:destination[:mode]` 302-redirect rules. `mode` is `no-deep` (default) or `deep`. See [Redirect Sites](#redirect-sites). |
+| `SITE_REWRITES` | `example.com ^/(\d+)$ /item.php?id=$1` | Newline-delimited internal rewrites (no client-visible redirect). One `<host> <regex> <replacement> [last\|break]` rule per line. See [Internal Rewrites](#internal-rewrites). |
 | `SITE_ALIASES` | `example.com:www.example.com,old.example.com` | Aliases per primary site. Aliases inherit the primary's type (static, static-php, proxy, or redirect). Bare aliases extend the preceding `primary:alias` group. |
 | `DEFAULT_SITE` | `example.com` | Optional target for unknown HTTP hostnames. May reference any primary from `STATIC_SITES`, `STATIC_PHP_SITES`, `PROXY_SITES`, or `SITE_REDIRECTS`. Unknown HTTPS SNI is still rejected. |
 | `BASIC_AUTH_FILES` | `admin.example.com:/run/secrets/admin.htpasswd` | Optional mounted htpasswd files per site. |
@@ -161,6 +162,97 @@ Other behavior worth knowing:
 - **Single hop, not two.** Plain HTTP requests to the source 302 directly to the final destination rather than first 302'ing to `https://<self>/` (the usual HTTP→HTTPS pattern). One redirect, not two.
 - **Mutually exclusive primaries.** A hostname listed in `SITE_REDIRECTS` cannot also be in `STATIC_SITES`, `STATIC_PHP_SITES`, or `PROXY_SITES`. The entrypoint fails fast on overlap.
 - **Aliases work.** `SITE_ALIASES=old.example.com:legacy.example.com` together with a `SITE_REDIRECTS` entry for `old.example.com` makes `legacy.example.com` redirect to the same destination.
+
+## Internal Rewrites
+
+`SITE_REWRITES` rewrites a request path **server-side**, with no redirect — the browser's address bar keeps showing the public URL while nginx internally serves a different path. This is the counterpart to [Redirect Sites](#redirect-sites): redirects change the client URL (302), rewrites do not.
+
+Typical use: expose a short, pretty public URL like `https://example.com/ASDF-YUIO` while the real handler lives at `/do/something/cool?code=ASDF-YUIO`.
+
+Unlike the other variables, `SITE_REWRITES` is **newline-delimited** (one rule per line), because regexes and replacement URLs routinely contain commas, colons, and slashes that would collide with a delimited grammar. Each line is whitespace-separated:
+
+```
+<host>  <regex>  <replacement>  [last|break]
+```
+
+```yaml
+environment:
+  SITE_REWRITES: |
+    example.com  ^/([A-Z]{4}-[A-Z]{4})$  /do/something/cool?code=$1
+    example.com  ^/p/(\d+)$               /products.php?id=$1
+```
+
+| Field | Meaning |
+|---|---|
+| `host` | A configured `STATIC_SITES`/`STATIC_PHP_SITES` primary or one of its aliases. The rule attaches to that site's server block. |
+| `regex` | nginx location regex matched against the request URI. Capture groups are referenced as `$1`…`$9` in the replacement. |
+| `replacement` | The internal target. **Must start with `/`.** Regex captures and a `?query` are allowed. |
+| `flag` | Optional: `last` (default — re-run location matching, e.g. to reach `try_files` or the `.php` handler) or `break` (stop rewriting, stay in the current location). |
+
+### Common patterns
+
+Each row is a single `SITE_REWRITES` line and the public→internal mapping it produces. `$1`, `$2`, … are the regex capture groups.
+
+| Goal | Rule | A request for… | …is served from |
+|---|---|---|---|
+| Short code → real handler | `shop.example.com  ^/([A-Z]{4}-[A-Z]{4})$  /do/something/cool?code=$1` | `/ASDF-YUIO` | `/do/something/cool?code=ASDF-YUIO` |
+| Pretty product URL → query | `shop.example.com  ^/p/(\d+)$  /products.php?id=$1` | `/p/42` | `/products.php?id=42` |
+| Hide the `.html` extension | `docs.example.com  ^/([a-z0-9-]+)$  /$1.html` | `/getting-started` | `/getting-started.html` |
+| Date-based blog permalinks | `blog.example.com  ^/(\d{4})/(\d{2})/([a-z0-9-]+)$  /post.php?y=$1&m=$2&slug=$3` | `/2026/06/hello-world` | `/post.php?y=2026&m=06&slug=hello-world` |
+| Versioned path → flat file | `api.example.com  ^/v1/status$  /status.json` | `/v1/status` | `/status.json` |
+| Front-controller (framework) routing | `app.example.com  ^/(?!index\.php)(.*)$  /index.php?route=$1` | `/users/7/edit` | `/index.php?route=users/7/edit` |
+
+The last row is the classic "send everything that isn't a real file to a single PHP entry point" pattern. On a `static-php` site, pair it with `try_files` so genuine static assets (CSS, images) are still served directly:
+
+```yaml
+# static-php site that routes all unknown paths through index.php
+environment:
+  STATIC_PHP_SITES: "app.example.com"
+  SITE_REWRITES: |
+    app.example.com  ^/(?!index\.php$)(?!.*\.[a-z0-9]+$).*$  /index.php
+```
+
+That regex rewrites to `/index.php` only when the path is **not** already `index.php` and does **not** end in a file extension, so `/style.css` and `/logo.png` keep being served as static files while `/dashboard` and `/users/7` reach the front controller. (For real frameworks you can usually skip `SITE_REWRITES` entirely and mount the framework's own `try_files` rule as a [custom snippet](#custom-nginx-snippets) — see the [Symfony example](#worked-example--symfony-rewrite-snippet). `SITE_REWRITES` shines for ad-hoc, per-path pretty URLs rather than whole-app routing.)
+
+A complete example, end to end — a single site carrying **several rewrites at once**:
+
+```yaml
+services:
+  proxy:
+    image: timorinne/nginx-auto-tls-proxy:latest-php
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./ssl:/ssl
+      - ./shop:/sites/shop.example.com
+    environment:
+      STATIC_PHP_SITES: "shop.example.com"
+      LETSENCRYPT_EMAIL: "admin@example.com"
+      SITE_REWRITES: |
+        shop.example.com  ^/([A-Z]{4}-[A-Z]{4})$  /redeem.php?code=$1
+        shop.example.com  ^/p/(\d+)$              /products.php?id=$1
+        shop.example.com  ^/u/([a-z0-9_]+)$       /profile.php?user=$1
+        shop.example.com  ^/sale$                 /index.php?promo=summer
+```
+
+All four rules attach to the same `shop.example.com` server block, in the order written. The result:
+
+| Public URL | Served internally from |
+|---|---|
+| `https://shop.example.com/ASDF-YUIO` | `/redeem.php?code=ASDF-YUIO` |
+| `https://shop.example.com/p/42` | `/products.php?id=42` |
+| `https://shop.example.com/u/timo` | `/profile.php?user=timo` |
+| `https://shop.example.com/sale` | `/index.php?promo=summer` |
+
+In every case the customer's address bar keeps showing the short public URL while the matching PHP script handles the request. Rules are evaluated **top to bottom**, and the first one whose regex matches wins (the `last` flag then re-runs location matching to reach the PHP handler). When two patterns could overlap, put the more specific rule first — e.g. a literal `^/sale$` before a broad `^/([a-z0-9-]+)$` catch-all — otherwise the broad rule would match first and the specific one would never fire.
+
+Other behavior worth knowing:
+
+- **Internal only.** The replacement must be a path. An `http(s)://` target would make nginx emit a 302 instead — for that, use `SITE_REDIRECTS`.
+- **Static and static-php only.** Proxy, redirect, and TLS-terminator sites reject `SITE_REWRITES`; the entrypoint fails fast.
+- **Query strings.** nginx appends the original query args unless the replacement contains a `?`. The `?code=$1` form above therefore replaces the original query; end the replacement with `?` to drop args entirely, or add `$is_args$args` to append them.
+- **Avoid loops.** If a rewrite target also matches a rule, nginx will cycle (capped at 10) and return `500`. Anchor your regexes (`^…$`) so targets don't re-match.
+- **Aliases work.** A rule written against an alias is applied to the owning primary's server block, so it takes effect for the primary and every alias that shares it.
+- **`$` in docker-compose.** Capture references are always `$1`…`$9`, which Compose passes through literally (it only substitutes `${name}`-style variables). If you ever place a `$` directly in front of a name — e.g. to forward the original query with `$is_args$args` — double it as `$$is_args$$args` so Compose doesn't try to interpolate it.
 
 ## Reverse Proxy Sites
 

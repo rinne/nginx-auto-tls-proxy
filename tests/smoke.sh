@@ -19,9 +19,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$TMP_DIR/backend" "$TMP_DIR/custom"
+mkdir -p "$TMP_DIR/backend" "$TMP_DIR/custom" "$TMP_DIR/sites/default.local"
 printf 'backend OK\n' > "$TMP_DIR/backend/index.html"
 printf 'custom root OK\n' > "$TMP_DIR/custom/index.html"
+printf 'rewrite landing OK\n' > "$TMP_DIR/sites/default.local/landing.html"
 
 cat > "$COMPOSE_FILE" <<EOF
 services:
@@ -41,6 +42,8 @@ services:
       PROXY_SITES: "proxy.local:http://backend/"
       SITE_ALIASES: "default.local:www.default.local"
       SITE_REDIRECTS: "shallow.local:default.local,deep.local:default.local:deep,explicit.local:default.local:no-deep"
+      SITE_REWRITES: |
+        default.local ^/code/([A-Z]{4}-[A-Z]{4})\$ /landing.html
       LETSENCRYPT_EMAIL: ""
       CLIENT_MAX_BODY_SIZE: "16m"
       PROXY_READ_TIMEOUT: "60s"
@@ -91,6 +94,29 @@ curl -fksS --resolve "proxy.local:$HTTPS_PORT:127.0.0.1" \
     "grep -q 'resolver 127.0.0.11 valid=5s' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf \
      && grep -q 'set \$upstream_proxy_local' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf \
      && grep -q 'proxy_pass \$upstream_proxy_local\$request_uri' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf"
+
+# --- SITE_REWRITES coverage ---
+# The generated config carries a quoted, internal `rewrite ... last;` line.
+"${COMPOSE[@]}" exec -T proxy sh -c \
+    'grep -q "rewrite \"\^/code/(\[A-Z\]{4}-\[A-Z\]{4})\$\" \"/landing.html\" last;" /etc/nginx/conf.d/nginx-auto-tls-proxy-default.local.conf' \
+    || { printf 'FAIL: SITE_REWRITES did not emit the expected quoted rewrite line\n'; exit 1; }
+
+# A matching public path is served internally: the client URL does NOT change
+# (no 302) and the body of the rewrite target is returned with a 200.
+rewrite_code="$(curl -ksS -o /dev/null -w '%{http_code}' \
+    --resolve "default.local:$HTTPS_PORT:127.0.0.1" "https://default.local:$HTTPS_PORT/code/ASDF-YUIO")"
+[[ "$rewrite_code" == "200" ]] \
+    || { printf 'FAIL: internal rewrite returned %s, expected 200 (must not redirect)\n' "$rewrite_code"; exit 1; }
+curl -fksS --resolve "default.local:$HTTPS_PORT:127.0.0.1" \
+    "https://default.local:$HTTPS_PORT/code/ASDF-YUIO" \
+    | grep -q 'rewrite landing OK' \
+    || { printf 'FAIL: internal rewrite did not serve the target content\n'; exit 1; }
+
+# A non-matching path is untouched by the rewrite (still served by the site).
+curl -fksS --resolve "default.local:$HTTPS_PORT:127.0.0.1" \
+    "https://default.local:$HTTPS_PORT/" \
+    | grep -q 'Site: default.local' \
+    || { printf 'FAIL: rewrite leaked onto non-matching paths\n'; exit 1; }
 
 # --- SITE_REDIRECTS coverage ---
 # Assert that a curl request returns 302 with the expected redirect_url. Uses
@@ -192,6 +218,53 @@ docker run --rm \
 ! grep -q "listen 443" /etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf \
     || { echo "FAIL: 443 catch-all should be omitted when no site uses 443"; exit 1; }
 '
+
+# --- SITE_REWRITES config generation & validation (DRY_RUN) ---
+# Positive: a rule written against an ALIAS lands on the owner's server block,
+# and the optional `break` flag is honored.
+docker run --rm \
+    -e STATIC_SITES="a.local" \
+    -e SITE_ALIASES="a.local:www.a.local" \
+    -e SITE_REWRITES=$'www.a.local ^/x$ /y.html break' \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh >/dev/null 2>&1
+grep -q "rewrite \"\^/x\$\" \"/y.html\" break;" /etc/nginx/conf.d/nginx-auto-tls-proxy-a.local.conf \
+    || { echo "FAIL: alias rewrite should land on owner block with break flag"; exit 1; }
+'
+
+# Negative: replacement without a leading slash (would become an external 302).
+docker run --rm \
+    -e STATIC_SITES="a.local" \
+    -e SITE_REWRITES=$'a.local ^/x$ http://evil.example/' \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected non-path replacement"; exit 1; }
+true
+' | grep -q 'replacement must be a path starting' \
+    || { printf 'FAIL: should reject SITE_REWRITES replacement without leading slash\n'; exit 1; }
+
+# Negative: rewrites are not allowed on proxy sites.
+docker run --rm \
+    -e PROXY_SITES="p.local:http://backend:3000/" \
+    -e SITE_REWRITES=$'p.local ^/x$ /y' \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected rewrite on proxy site"; exit 1; }
+true
+' | grep -q 'only valid for static or static-php sites' \
+    || { printf 'FAIL: should reject SITE_REWRITES on a proxy site\n'; exit 1; }
+
+# Negative: rewrite host that is not a configured site/alias.
+docker run --rm \
+    -e STATIC_SITES="a.local" \
+    -e SITE_REWRITES=$'nope.local ^/x$ /y' \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected unknown rewrite host"; exit 1; }
+true
+' | grep -q 'must be a configured site or alias' \
+    || { printf 'FAIL: should reject SITE_REWRITES for an unknown host\n'; exit 1; }
 
 # --- TLS_TERMINATOR_PROXY config generation (DRY_RUN) ---
 # Basic stream config: correct listen port, variable proxy_pass, HTTP ACME block, no HTTPS in conf.d
