@@ -71,6 +71,41 @@ is_non_negative_int() {
     [[ "$1" =~ ^(0|[1-9][0-9]*)$ ]]
 }
 
+# Validate a single SITE_ALLOWED_IPS token: an IPv4 address, an IPv4 CIDR
+# (a.b.c.d/0-32), a bracketed IPv6 address ([2001:db8::1]), or a bracketed IPv6
+# CIDR ([2001:db8::/32]). Bracketing IPv6 keeps its colons from colliding with
+# the host:ip delimiter. The character set is restricted to what nginx
+# allow/deny accept, so values can be emitted into the config verbatim.
+is_allowed_ip() {
+    local v="$1"
+    if [[ "$v" == \[*\] ]]; then
+        local inner="${v:1:${#v}-2}"
+        local addr="$inner"
+        if [[ "$inner" == */* ]]; then
+            addr="${inner%/*}"
+            local len="${inner#*/}"
+            [[ "$len" =~ ^[0-9]{1,3}$ ]] || return 1
+            (( len >= 0 && len <= 128 )) || return 1
+        fi
+        [[ "$addr" == *:* ]] || return 1
+        [[ "$addr" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+        return 0
+    fi
+    local addr="$v"
+    if [[ "$v" == */* ]]; then
+        addr="${v%/*}"
+        local len="${v#*/}"
+        [[ "$len" =~ ^[0-9]{1,2}$ ]] || return 1
+        (( len >= 0 && len <= 32 )) || return 1
+    fi
+    [[ "$addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    local IFS=. octet
+    for octet in $addr; do
+        (( octet <= 255 )) || return 1
+    done
+    return 0
+}
+
 # PHP memory limit: integer + optional K/M/G suffix, or '-1' for unlimited.
 is_php_memory_limit() {
     [[ "$1" == "-1" ]] && return 0
@@ -180,6 +215,18 @@ nginx_rewrite_lines() {
     printf '%s' "${SITE_REWRITES_MAP["$site"]}"
 }
 
+# Server-scope IP allow list for a site (from SITE_ALLOWED_IPS). Each stored
+# entry is already a fully-formed `    allow <ip>;` line; we close the list with
+# `deny all;` so every non-matching client gets a 403. Emitted only on the HTTPS
+# server block, so the port-80 block stays open for ACME challenges and the
+# HTTP->HTTPS redirect. When a site has no entry, all clients are allowed (the
+# directives are simply absent), keeping the default backwards-compatible.
+nginx_allow_lines() {
+    local site="$1"
+    [[ "${SITE_ALLOWED_IPS_MAP["$site"]+isset}" == "isset" ]] || return 0
+    printf '%s    deny all;\n' "${SITE_ALLOWED_IPS_MAP["$site"]}"
+}
+
 # Curated sensitive-path denylist applied to STATIC_PHP_SITES server blocks.
 nginx_php_denylist() {
     cat <<'EOF'
@@ -248,6 +295,7 @@ declare -A PROXY_MAP=()
 declare -A REDIRECT_MAP=()
 declare -A REDIRECT_MODE_MAP=()
 declare -A SITE_REWRITES_MAP=()
+declare -A SITE_ALLOWED_IPS_MAP=()
 declare -A SITE_ALIASES_MAP=()
 declare -A STATIC_ROOT_MAP=()
 declare -A ALL_SITE_MAP=()
@@ -520,6 +568,45 @@ if [[ -n "${SITE_REWRITES:-}" ]]; then
             || die "SITE_REWRITES flag must be 'last' or 'break'; got: $_rw_flag (in $_line)"
         SITE_REWRITES_MAP["$_rw_owner"]="${SITE_REWRITES_MAP["$_rw_owner"]:-}    rewrite \"$_rw_pattern\" \"$_rw_repl\" $_rw_flag;"$'\n'
     done <<< "$SITE_REWRITES"
+fi
+
+# Per-site IP allow lists: SITE_ALLOWED_IPS is a SEMICOLON-separated list of
+# `host:ip[,ip...]` groups (semicolons keep one site's IP list visually distinct
+# from the next site's host). Within a group the comma-separated tokens are the
+# allowed addresses: IPv4 addresses/CIDRs are bare (1.2.3.4, 1.2.3.0/24) and IPv6
+# addresses/CIDRs are bracketed ([2001:db8::1], [2001:db8::/32]). A host may be a
+# primary site or any of its aliases; groups accumulate on the owning server
+# block. TLS-terminator sites are rejected (no HTTP layer to return 403).
+# Absence of any entry for a site means all client IPs are allowed (the default).
+if [[ -n "${SITE_ALLOWED_IPS:-}" ]]; then
+    IFS=';' read -ra _ip_groups <<< "$SITE_ALLOWED_IPS"
+    for _g in "${_ip_groups[@]}"; do
+        _g="$(trim_spaces "$_g")"
+        [[ -z "$_g" ]] && continue
+        [[ "$_g" == *:* ]] || die "Malformed SITE_ALLOWED_IPS group, expected host:ip[,ip...]: $_g"
+        _ip_label="$(lower "$(trim_spaces "${_g%%:*}")")"
+        _ip_list="${_g#*:}"
+        require_hostname "$_ip_label" "SITE_ALLOWED_IPS"
+        [[ "${SERVER_NAME_OWNER["$_ip_label"]+isset}" == "isset" ]] \
+            || die "SITE_ALLOWED_IPS host must be a configured site or alias: $_ip_label"
+        _ip_owner="${SERVER_NAME_OWNER["$_ip_label"]}"
+        [[ "$(site_mode "$_ip_owner")" == "tls-terminator" ]] \
+            && die "SITE_ALLOWED_IPS cannot be used with TLS_TERMINATOR_PROXY site: $_ip_owner (no HTTP layer to return 403)"
+        _ip_count=0
+        IFS=',' read -ra _ips <<< "$_ip_list"
+        for _ip in "${_ips[@]}"; do
+            _ip="$(trim_spaces "$_ip")"
+            [[ -z "$_ip" ]] && continue
+            is_allowed_ip "$_ip" \
+                || die "Invalid IP/CIDR in SITE_ALLOWED_IPS for $_ip_label: $_ip (IPv6 must be bracketed, e.g. [2001:db8::/32])"
+            # Strip brackets: nginx allow/deny take the bare IPv6 address.
+            _nip="$_ip"
+            [[ "$_nip" == \[*\] ]] && _nip="${_nip:1:${#_nip}-2}"
+            SITE_ALLOWED_IPS_MAP["$_ip_owner"]="${SITE_ALLOWED_IPS_MAP["$_ip_owner"]:-}    allow $_nip;"$'\n'
+            _ip_count=$((_ip_count + 1))
+        done
+        [[ "$_ip_count" -gt 0 ]] || die "SITE_ALLOWED_IPS group for $_ip_label has no IP addresses: $_g"
+    done
 fi
 
 DEFAULT_SITE="$(lower "$(trim_spaces "${DEFAULT_SITE:-}")")"
@@ -862,7 +949,7 @@ server {
 $(nginx_ocsp_lines "$site")
 $(nginx_hsts_line)
     include /etc/nginx/site-conf.d/$site/*.conf;
-
+$(nginx_allow_lines "$site")
     location / {
 $(nginx_auth_lines "$site")
         return 302 $http_redirect_target;
@@ -899,7 +986,7 @@ $(nginx_ocsp_lines "$site")
     client_max_body_size $CLIENT_MAX_BODY_SIZE;
 $(nginx_hsts_line)
     include /etc/nginx/site-conf.d/$site/*.conf;
-
+$(nginx_allow_lines "$site")
     location / {
 $(nginx_auth_lines "$site")
 $resolver_lines
@@ -931,7 +1018,7 @@ $(nginx_ocsp_lines "$site")
     client_max_body_size $CLIENT_MAX_BODY_SIZE;
 $(nginx_hsts_line)
     include /etc/nginx/site-conf.d/$site/*.conf;
-
+$(nginx_allow_lines "$site")
     root "$site_root";
     index index.php index.html index.htm;
 $(nginx_static_fallback_lines)
@@ -975,7 +1062,7 @@ $(nginx_ocsp_lines "$site")
     client_max_body_size $CLIENT_MAX_BODY_SIZE;
 $(nginx_hsts_line)
     include /etc/nginx/site-conf.d/$site/*.conf;
-
+$(nginx_allow_lines "$site")
     root "$site_root";
     index index.html index.htm;
 $(nginx_static_fallback_lines)
@@ -1022,7 +1109,11 @@ print_startup_summary() {
         if [[ "${SITE_REWRITES_MAP["$site"]+isset}" == "isset" ]]; then
             _rw_info=" rewrites=$(grep -c . <<< "${SITE_REWRITES_MAP["$site"]}")"
         fi
-        log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")${_port_info}${_rw_info}"
+        local _ip_info=""
+        if [[ "${SITE_ALLOWED_IPS_MAP["$site"]+isset}" == "isset" ]]; then
+            _ip_info=" allowed-ips=$(grep -c . <<< "${SITE_ALLOWED_IPS_MAP["$site"]}")"
+        fi
+        log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")${_port_info}${_rw_info}${_ip_info}"
     done
 }
 

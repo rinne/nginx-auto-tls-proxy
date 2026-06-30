@@ -37,13 +37,14 @@ services:
       - "$TMP_DIR/sites:/sites"
       - "$TMP_DIR/custom:/custom/custom.local"
     environment:
-      STATIC_SITES: "default.local,custom.local"
+      STATIC_SITES: "default.local,custom.local,allowed.local,locked.local"
       STATIC_SITE_ROOTS: "custom.local:/custom/custom.local"
       PROXY_SITES: "proxy.local:http://backend/"
       SITE_ALIASES: "default.local:www.default.local"
       SITE_REDIRECTS: "shallow.local:default.local,deep.local:default.local:deep,explicit.local:default.local:no-deep"
       SITE_REWRITES: |
         default.local ^/code/([A-Z]{4}-[A-Z]{4})\$ /landing.html
+      SITE_ALLOWED_IPS: "allowed.local:10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,[2001:db8::/32];locked.local:10.255.255.0/24,[2001:db8::/32]"
       LETSENCRYPT_EMAIL: ""
       CLIENT_MAX_BODY_SIZE: "16m"
       PROXY_READ_TIMEOUT: "60s"
@@ -168,6 +169,44 @@ curl -fsS -H 'Host: shallow.local' \
     | grep -q 'challenge-shallow' \
     || { printf 'FAIL: ACME challenge passthrough broken on redirect source shallow.local\n'; exit 1; }
 
+# --- SITE_ALLOWED_IPS coverage ---
+# The generated HTTPS block carries the allow/deny list; IPv6 brackets are
+# stripped for nginx, and the HTTP (port 80) block stays open for ACME.
+"${COMPOSE[@]}" exec -T proxy sh -c \
+    'grep -q "allow 10.255.255.0/24;" /etc/nginx/conf.d/nginx-auto-tls-proxy-locked.local.conf \
+     && grep -q "allow 2001:db8::/32;" /etc/nginx/conf.d/nginx-auto-tls-proxy-locked.local.conf \
+     && grep -q "deny all;" /etc/nginx/conf.d/nginx-auto-tls-proxy-locked.local.conf' \
+    || { printf 'FAIL: SITE_ALLOWED_IPS did not emit the expected allow/deny lines\n'; exit 1; }
+
+# Backwards compatible: a site without an allow list gets no deny directive.
+! "${COMPOSE[@]}" exec -T proxy sh -c \
+    'grep -q "deny all;" /etc/nginx/conf.d/nginx-auto-tls-proxy-default.local.conf' \
+    || { printf 'FAIL: a site without SITE_ALLOWED_IPS must not carry a deny rule\n'; exit 1; }
+
+# The test client reaches nginx via the Docker bridge gateway (RFC1918), which
+# allowed.local permits -> 200, and locked.local does not -> 403.
+allowed_code="$(curl -ksS -o /dev/null -w '%{http_code}' \
+    --resolve "allowed.local:$HTTPS_PORT:127.0.0.1" "https://allowed.local:$HTTPS_PORT/")"
+[[ "$allowed_code" == "200" ]] \
+    || { printf 'FAIL: allowed.local returned %s, expected 200 (client IP is in the allow list)\n' "$allowed_code"; exit 1; }
+
+locked_code="$(curl -ksS -o /dev/null -w '%{http_code}' \
+    --resolve "locked.local:$HTTPS_PORT:127.0.0.1" "https://locked.local:$HTTPS_PORT/")"
+[[ "$locked_code" == "403" ]] \
+    || { printf 'FAIL: locked.local returned %s, expected 403 (client IP not in the allow list)\n' "$locked_code"; exit 1; }
+
+# Plain HTTP stays open on a locked site: ACME passthrough and the HTTP->HTTPS
+# redirect must both still work (the allow list is HTTPS-only).
+"${COMPOSE[@]}" exec -T proxy sh -c \
+    'printf challenge-locked > /var/www/acme/.well-known/acme-challenge/locked-token'
+curl -fsS -H 'Host: locked.local' \
+    "http://127.0.0.1:$HTTP_PORT/.well-known/acme-challenge/locked-token" \
+    | grep -q 'challenge-locked' \
+    || { printf 'FAIL: ACME challenge passthrough broken on IP-locked locked.local\n'; exit 1; }
+assert_redirect 'HTTP locked.local (open for redirect)' \
+    'https://locked.local/some/path' \
+    -H 'Host: locked.local' "http://127.0.0.1:$HTTP_PORT/some/path"
+
 # Capture the built image ID before tearing down (compose state is lost after down).
 PORT_IMG="$("${COMPOSE[@]}" images -q proxy 2>/dev/null | head -1)"
 
@@ -265,6 +304,90 @@ docker run --rm \
 true
 ' | grep -q 'must be a configured site or alias' \
     || { printf 'FAIL: should reject SITE_REWRITES for an unknown host\n'; exit 1; }
+
+# --- SITE_ALLOWED_IPS config generation & validation (DRY_RUN) ---
+# Positive: a rule written against an ALIAS lands on the owner's HTTPS block,
+# IPv6 brackets are stripped, and the list is closed with `deny all;`.
+docker run --rm \
+    -e STATIC_SITES="a.local" \
+    -e SITE_ALIASES="a.local:www.a.local" \
+    -e SITE_ALLOWED_IPS="www.a.local:10.1.2.0/24,[2001:db8::1]" \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh >/dev/null 2>&1
+grep -q "allow 10.1.2.0/24;" /etc/nginx/conf.d/nginx-auto-tls-proxy-a.local.conf \
+    || { echo "FAIL: alias allow rule should land on owner block"; exit 1; }
+grep -q "allow 2001:db8::1;" /etc/nginx/conf.d/nginx-auto-tls-proxy-a.local.conf \
+    || { echo "FAIL: bracketed IPv6 should be emitted without brackets"; exit 1; }
+grep -q "deny all;" /etc/nginx/conf.d/nginx-auto-tls-proxy-a.local.conf \
+    || { echo "FAIL: allow list should be closed with deny all"; exit 1; }
+'
+
+# Negative: invalid IP/CIDR is rejected.
+docker run --rm \
+    -e STATIC_SITES="a.local" \
+    -e SITE_ALLOWED_IPS="a.local:10.0.0.0/33" \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected invalid CIDR"; exit 1; }
+true
+' | grep -q 'Invalid IP/CIDR in SITE_ALLOWED_IPS' \
+    || { printf 'FAIL: should reject an out-of-range CIDR in SITE_ALLOWED_IPS\n'; exit 1; }
+
+# Negative: unbracketed IPv6 is rejected (must be bracketed).
+docker run --rm \
+    -e STATIC_SITES="a.local" \
+    -e SITE_ALLOWED_IPS="a.local:2001:db8::1" \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected unbracketed IPv6"; exit 1; }
+true
+' | grep -q 'Invalid IP/CIDR in SITE_ALLOWED_IPS' \
+    || { printf 'FAIL: should reject unbracketed IPv6 in SITE_ALLOWED_IPS\n'; exit 1; }
+
+# Negative: a group with no host:ip colon (e.g. a bare IP) is rejected.
+docker run --rm \
+    -e STATIC_SITES="a.local" \
+    -e SITE_ALLOWED_IPS="10.0.0.1" \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected a group without host:ip"; exit 1; }
+true
+' | grep -q 'Malformed SITE_ALLOWED_IPS group' \
+    || { printf 'FAIL: should reject a group without a host:ip in SITE_ALLOWED_IPS\n'; exit 1; }
+
+# Negative: a host group with an empty IP list is rejected.
+docker run --rm \
+    -e STATIC_SITES="a.local" \
+    -e SITE_ALLOWED_IPS="a.local:" \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected an empty IP list"; exit 1; }
+true
+' | grep -q 'has no IP addresses' \
+    || { printf 'FAIL: should reject a host group with no IPs in SITE_ALLOWED_IPS\n'; exit 1; }
+
+# Negative: unknown host is rejected.
+docker run --rm \
+    -e STATIC_SITES="a.local" \
+    -e SITE_ALLOWED_IPS="nope.local:10.0.0.1" \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected unknown host"; exit 1; }
+true
+' | grep -q 'must be a configured site or alias' \
+    || { printf 'FAIL: should reject SITE_ALLOWED_IPS for an unknown host\n'; exit 1; }
+
+# Negative: SITE_ALLOWED_IPS is not allowed on a TLS-terminator site.
+docker run --rm \
+    -e TLS_TERMINATOR_PROXY="s.local:4343:backend:8080" \
+    -e SITE_ALLOWED_IPS="s.local:10.0.0.1" \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected allow list on TLS-terminator"; exit 1; }
+true
+' | grep -q 'cannot be used with TLS_TERMINATOR_PROXY' \
+    || { printf 'FAIL: should reject SITE_ALLOWED_IPS on a TLS_TERMINATOR_PROXY site\n'; exit 1; }
 
 # --- TLS_TERMINATOR_PROXY config generation (DRY_RUN) ---
 # Basic stream config: correct listen port, variable proxy_pass, HTTP ACME block, no HTTPS in conf.d

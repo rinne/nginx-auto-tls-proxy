@@ -104,6 +104,7 @@ docker compose -f dc/try/docker-compose.yaml down -v
 | `SITE_ALIASES` | `example.com:www.example.com,old.example.com` | Aliases per primary site. Aliases inherit the primary's type (static, static-php, proxy, or redirect). Bare aliases extend the preceding `primary:alias` group. |
 | `DEFAULT_SITE` | `example.com` | Optional target for unknown HTTP hostnames. May reference any primary from `STATIC_SITES`, `STATIC_PHP_SITES`, `PROXY_SITES`, or `SITE_REDIRECTS`. Unknown HTTPS SNI is still rejected. |
 | `BASIC_AUTH_FILES` | `admin.example.com:/run/secrets/admin.htpasswd` | Optional mounted htpasswd files per site. |
+| `SITE_ALLOWED_IPS` | `example.com:10.20.30.0/24,10.20.31.43,[2001:db8::/32];example2.com:127.0.0.1` | Optional per-site IP allow list enforced on the HTTPS server (non-matching clients get `403`). Semicolon-separated `host:ip[,ip...]` groups. IPv6 must be bracketed. See [IP Allow Lists](#ip-allow-lists). |
 | `CLIENT_MAX_BODY_SIZE` | `16m` | nginx request body limit for generated HTTPS servers. On `:-php` images this also drives PHP's `upload_max_filesize` and `post_max_size` so the two layers never disagree. |
 | `PROXY_READ_TIMEOUT` | `60s` | Reverse-proxy read timeout. |
 | `PROXY_SEND_TIMEOUT` | `60s` | Reverse-proxy send timeout. |
@@ -245,14 +246,75 @@ All four rules attach to the same `shop.example.com` server block, in the order 
 
 In every case the customer's address bar keeps showing the short public URL while the matching PHP script handles the request. Rules are evaluated **top to bottom**, and the first one whose regex matches wins (the `last` flag then re-runs location matching to reach the PHP handler). When two patterns could overlap, put the more specific rule first — e.g. a literal `^/sale$` before a broad `^/([a-z0-9-]+)$` catch-all — otherwise the broad rule would match first and the specific one would never fire.
 
+### The rewritten query string is server-side only
+
+This is the most common surprise, so it's worth stating plainly:
+
+> A rewrite is **internal** — the browser's address bar keeps showing the original public URL (`/ASDF-YUIO`), **not** the rewrite target. The `?…=$1` query you add in the replacement exists only *inside nginx*. It is handed to a dynamic handler (PHP, CGI, a proxied backend) as the request's query args, but it **never appears in the browser URL**.
+
+The practical consequence:
+
+- **Dynamic target (`.php` on the `-php` image): works.** `buy.php` reads `$_GET['id']` from nginx's server-side query, so `^/(...)$ → /buy.php?id=$1` delivers the captured value.
+- **Static target (`.html`) with client-side JavaScript: the query is invisible.** nginx serves the file bytes and ignores the `?id=…`; meanwhile the page's JavaScript reads `window.location.search`, which is empty because the browser URL is still `/ASDF-YUIO`. The script sees no `id` and reports it missing — even though visiting `/buy.html?id=ASDF-YUIO` directly works fine.
+
+If you want a **static** page to know the captured value while keeping the pretty URL, read it from the path instead of a query string. The code is already in `window.location.pathname`:
+
+```yaml
+# rewrite to a bare static file — no query needed
+SITE_REWRITES: |
+  shop.example.com  ^/([A-Z0-9]{3}-[A-Z0-9]{3})$  /buy.html
+```
+
+```js
+// in buy.html — read the short code from the path the browser still shows
+const id = location.pathname.slice(1);            // "ASDF-YUIO"
+if (!/^[A-Z0-9]{3}-[A-Z0-9]{3}$/.test(id)) { /* invalid code */ }
+```
+
+Use the `?…=$1` form only when the target is a server-side handler (`.php`, CGI, proxy) that reads the query from nginx. If you genuinely need the browser to display `/buy.html?id=…`, that is a 302 **redirect**, not an internal rewrite, and it gives up the short URL — `SITE_REWRITES` intentionally cannot do it (the replacement must be a path, which keeps the rewrite internal).
+
 Other behavior worth knowing:
 
 - **Internal only.** The replacement must be a path. An `http(s)://` target would make nginx emit a 302 instead — for that, use `SITE_REDIRECTS`.
 - **Static and static-php only.** Proxy, redirect, and TLS-terminator sites reject `SITE_REWRITES`; the entrypoint fails fast.
-- **Query strings.** nginx appends the original query args unless the replacement contains a `?`. The `?code=$1` form above therefore replaces the original query; end the replacement with `?` to drop args entirely, or add `$is_args$args` to append them.
+- **Query strings.** nginx appends the original query args unless the replacement contains a `?`. The `?code=$1` form above therefore replaces the original query; end the replacement with `?` to drop args entirely, or add `$is_args$args` to append them. Remember this query is server-side only — see [The rewritten query string is server-side only](#the-rewritten-query-string-is-server-side-only).
 - **Avoid loops.** If a rewrite target also matches a rule, nginx will cycle (capped at 10) and return `500`. Anchor your regexes (`^…$`) so targets don't re-match.
 - **Aliases work.** A rule written against an alias is applied to the owning primary's server block, so it takes effect for the primary and every alias that shares it.
 - **`$` in docker-compose.** Capture references are always `$1`…`$9`, which Compose passes through literally (it only substitutes `${name}`-style variables). If you ever place a `$` directly in front of a name — e.g. to forward the original query with `$is_args$args` — double it as `$$is_args$$args` so Compose doesn't try to interpolate it.
+
+## IP Allow Lists
+
+`SITE_ALLOWED_IPS` restricts who may reach a site over HTTPS at the nginx level. When a site has an allow list, nginx emits `allow` rules for the listed addresses followed by `deny all`, so any client whose IP is not covered gets a plain `403 Forbidden`. Sites with no entry are unaffected — the default is still "all clients allowed", so adding the variable is fully backwards-compatible.
+
+```yaml
+environment:
+  SITE_ALLOWED_IPS: "intranet.example.com:10.20.30.0/24,10.20.31.43,192.168.0.0/16;admin.example.com:127.0.0.1,[2001:db8::/32]"
+```
+
+The value is a **semicolon-separated** list of `host:ip[,ip...]` groups; within each group the **comma-separated** tokens are the addresses allowed for that host. The example above parses as:
+
+| Host | Allowed clients |
+|---|---|
+| `intranet.example.com` | `10.20.30.0/24`, `10.20.31.43`, `192.168.0.0/16` |
+| `admin.example.com` | `127.0.0.1`, `2001:db8::/32` |
+
+> **Note — this variable's separators are deliberately the opposite way round from the rest.** Everywhere else in this image a comma separates per-site entries (`STATIC_SITES`, `PROXY_SITES`, `SITE_ALIASES`, …). `SITE_ALLOWED_IPS` instead uses a **semicolon between sites** and reserves the **comma for the IP list of a single site**. Without that split, the comma before the next hostname would read as just another IP in the previous site's list (`…192.168.0.0/16,admin.example.com:…`), which is the one genuinely confusing case. So: **comma always means "another IP for the same site"; semicolon starts a new site.**
+
+What each token may contain:
+
+- **A single IPv4 address** — `10.20.31.43`
+- **An IPv4 network** in CIDR form — `10.20.30.0/24`, `192.168.0.0/16`
+- **A single IPv6 address**, bracketed — `[2001:db8::1]`
+- **An IPv6 network** in CIDR form, bracketed — `[2001:db8::/32]`
+
+IPv6 is **bracketed** so its colons never collide with the `host:ip` delimiter. Explicit-netmask forms (`1.2.3.0/255.255.255.0`) and ranges (`1.2.3.4-1.2.3.7`) are not supported — use CIDR.
+
+Behavior and scope:
+
+- **HTTPS only.** The allow list is emitted on the HTTPS server block. Plain HTTP on port 80 stays open so ACME (`/.well-known/acme-challenge/`) and the HTTP→HTTPS redirect keep working even for a locked-down site.
+- **All site types except TLS-terminator.** Static, static-php, proxy, and redirect sites accept `SITE_ALLOWED_IPS`. TLS-terminator (L4 `stream`) sites have no HTTP layer to return a 403 and are rejected at startup.
+- **Aliases work.** A rule written against an alias applies to the owning primary's server block, so it covers the primary and every alias that shares it.
+- **Behind a trusted proxy.** nginx matches the connecting `$remote_addr`. If clients reach this container through an upstream load balancer, set [`REAL_IP_FROM`](#environment-variables) / `REAL_IP_HEADER` so the real client IP is matched instead of the proxy's.
 
 ## Reverse Proxy Sites
 

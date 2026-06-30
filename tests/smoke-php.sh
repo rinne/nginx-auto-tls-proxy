@@ -76,6 +76,7 @@ services:
       SITE_ALIASES: "default.local:www.default.local,php.local:www.php.local"
       SITE_REWRITES: |
         php.local ^/code/([A-Z]{4}-[A-Z]{4})\$ /lookup.php?code=\$1
+      SITE_ALLOWED_IPS: "php.local:10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,[2001:db8::/32]"
       LETSENCRYPT_EMAIL: ""
       CLIENT_MAX_BODY_SIZE: "16m"
       PROXY_READ_TIMEOUT: "60s"
@@ -184,6 +185,16 @@ fi
 # nginx config, not from a missing fixture).
 "${COMPOSE[@]}" exec -T proxy test -f /sites/static.local/bad.php \
     || { printf 'FAIL: bad.php fixture not present in static-site docroot inside the container\n'; exit 1; }
+
+# --- SITE_ALLOWED_IPS on a static-php site. ---
+# The allow/deny list must be emitted on the static-php HTTPS block; because the
+# test client's IP (Docker bridge gateway) is within the allowed RFC1918 ranges,
+# every PHP assertion above still returned 200 with the list in force.
+"${COMPOSE[@]}" exec -T proxy sh -c \
+    'grep -q "allow 172.16.0.0/12;" /etc/nginx/conf.d/nginx-auto-tls-proxy-php.local.conf \
+     && grep -q "allow 2001:db8::/32;" /etc/nginx/conf.d/nginx-auto-tls-proxy-php.local.conf \
+     && grep -q "deny all;" /etc/nginx/conf.d/nginx-auto-tls-proxy-php.local.conf' \
+    || { printf 'FAIL: SITE_ALLOWED_IPS did not emit allow/deny on the static-php block\n'; exit 1; }
 
 # --- FastCGI /ping endpoint returns "pong". ---
 ping_response="$("${COMPOSE[@]}" exec -T proxy sh -c '
