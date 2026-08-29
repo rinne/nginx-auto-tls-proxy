@@ -2,6 +2,23 @@
 
 All notable changes to `nginx-auto-tls-proxy` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-08-29
+
+### Added
+
+- New `PROXY_STREAM_PATHS` environment variable marking long-lived streaming endpoints — Server-Sent Events and anything else that must reach the client as it is produced — on reverse-proxy sites. Format: comma-separated `host:/path-prefix[:timeout]`, where the timeout is optional and defaults to `10m`. Each entry emits one `location ^~ <prefix>` on that site's HTTPS server block with `proxy_buffering off`, `proxy_cache off`, `gzip off`, and its own `proxy_read_timeout` / `proxy_send_timeout`.
+- Without it, nginx's default `proxy_buffering on` holds the whole response until it ends — which for SSE is never — so the client sees nothing at all, and the global `PROXY_READ_TIMEOUT` cuts an idle stream after 60 seconds. Neither failure is visible from the application side.
+- The opt-in is **per path, not per site**: ordinary responses on the same host keep their buffering and the global timeouts, so nothing else on the site pays for one streaming endpoint.
+- The generated location repeats the site's `auth_basic` directives, because basic auth is emitted at location scope and would not otherwise apply — a streaming endpoint on a `BASIC_AUTH_FILES` site stays authenticated. `SITE_ALLOWED_IPS`, which is emitted at server scope, covers the new location automatically.
+- A host may be a primary or an alias, resolving to the owning server block. Startup rejects non-proxy sites (static, static-php, redirect, TLS-terminator), unknown hosts, malformed timeouts, non-absolute paths, duplicate prefixes on one site, and `/` — which nginx would treat as a duplicate of `location /` and refuse to start on.
+- `PROXY_STREAM_PATHS` is refused with a remediation message when `PROXY_RESOLVER=default` is combined with an upstream URL that carries a path of its own, a combination a prefix location cannot reproduce faithfully. Every other resolver and upstream combination is supported.
+- The startup site plan reports a `stream-paths=<n>` count for each site carrying entries.
+- `tests/smoke.sh` and `tests/smoke-php.sh` gain a dedicated streaming stack running with a deliberately short 2s global timeout and a 30s per-path override, asserting **behaviour** rather than config text: that the first event arrives within 2s (impossible with buffering on), that a later event past the global timeout still arrives, that an unlisted path on the same host still buffers and is still cut by the global timeout, and that a streaming endpoint on a basic-auth site returns 401 without credentials and streams with them. Config-shape and validation assertions accompany them, including a guard that no `proxy_buffering` or prefix location is emitted when the variable is unset.
+
+### Changed
+
+- Generated proxy server blocks are now written in two parts so the streaming locations can be appended after `location /`. Output is byte-for-byte identical to 0.8.0 when `PROXY_STREAM_PATHS` is unset, verified across every site type.
+
 ## [0.8.0] - 2026-06-30
 
 ### Added

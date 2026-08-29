@@ -8,6 +8,8 @@ Self-contained nginx reverse proxy container with automatic per-site TLS, Let's 
 
 - Static sites from `/sites/<domain>` or a custom mounted htdocs root.
 - Reverse proxy sites with WebSocket upgrade headers.
+- Long-lived streaming (SSE) endpoints with per-path buffering and timeout control.
+- L4 TLS termination for non-HTTP backends via the nginx `stream` module.
 - **Optional PHP-enabled static sites** via the separate `:<ver>-php` image tag.
 - Per-site aliases and per-site SNI certificates.
 - Self-signed fallback certificates on cold start.
@@ -99,6 +101,7 @@ docker compose -f dc/try/docker-compose.yaml down -v
 | `STATIC_PHP_SITES` | `blog.example.com,wiki.example.com` | Comma-separated PHP-enabled static site hostnames. See [PHP-Enabled Sites](#php-enabled-sites). **Requires the `:-php` image tag.** |
 | `STATIC_SITE_ROOTS` | `docs.example.com:/htdocs/docs` | Optional `domain:absolute-path` overrides for selected static site roots (works for both `STATIC_SITES` and `STATIC_PHP_SITES`). |
 | `PROXY_SITES` | `app.example.com:http://app:3000/` | Comma-separated `domain:upstream-url` reverse proxy mappings. |
+| `TLS_TERMINATOR_PROXY` | `db.example.com:4343:postgres:5432` | Comma-separated `host:listen_port:backend_host:backend_port[:proxy_protocol]` entries for L4 TLS termination via the nginx `stream` module. Each entry needs its own listen port. See [TLS Terminator Proxies](#tls-terminator-proxies). |
 | `SITE_REDIRECTS` | `old.example.com:example.com,api2.example.com:api.example.com:deep` | Comma-separated `source:destination[:mode]` 302-redirect rules. `mode` is `no-deep` (default) or `deep`. See [Redirect Sites](#redirect-sites). |
 | `SITE_REWRITES` | `example.com ^/(\d+)$ /item.php?id=$1` | Newline-delimited internal rewrites (no client-visible redirect). One `<host> <regex> <replacement> [last\|break]` rule per line. See [Internal Rewrites](#internal-rewrites). |
 | `SITE_ALIASES` | `example.com:www.example.com,old.example.com` | Aliases per primary site. Aliases inherit the primary's type (static, static-php, proxy, or redirect). Bare aliases extend the preceding `primary:alias` group. |
@@ -108,6 +111,10 @@ docker compose -f dc/try/docker-compose.yaml down -v
 | `CLIENT_MAX_BODY_SIZE` | `16m` | nginx request body limit for generated HTTPS servers. On `:-php` images this also drives PHP's `upload_max_filesize` and `post_max_size` so the two layers never disagree. |
 | `PROXY_READ_TIMEOUT` | `60s` | Reverse-proxy read timeout. |
 | `PROXY_SEND_TIMEOUT` | `60s` | Reverse-proxy send timeout. |
+| `PROXY_STREAM_PATHS` | `app.example.com:/events,api.example.com:/live:2h` | Comma-separated `host:/path-prefix[:timeout]` entries marking long-lived streaming endpoints on proxy sites. Disables response buffering and overrides the read/send timeouts for that prefix only. Timeout defaults to `10m`. See [Streaming Responses (SSE)](#streaming-responses-sse). |
+| `PROXY_RESOLVER` | `127.0.0.11` | DNS resolver used for proxy and stream upstreams; default `127.0.0.11` (Docker's embedded DNS). `default` omits the resolver directive and falls back to nginx's startup-time resolution. See [Upstream DNS Resolution](#upstream-dns-resolution). |
+| `PROXY_RESOLVER_VALID` | `5s` | How long nginx caches a resolved upstream address; default `5s`. Ignored when `PROXY_RESOLVER=default`. |
+| `HTTPS_PORT_OVERRIDE` | `admin.example.com:4444` | Comma-separated `host:port` pairs serving specific hosts on a non-443 HTTPS port. Port `80` is rejected; `443` is a no-op. See [Non-Standard HTTPS Ports](#non-standard-https-ports). |
 | `PHP_FPM_PROFILE` | `M` | One of `S`, `M`, `L`, `XL`, `XXL` (case-insensitive). FPM pool sizing profile; default `M`. See [PHP-Enabled Sites](#php-enabled-sites). |
 | `PHP_MEMORY_LIMIT` | `128M` | PHP `memory_limit`; default `128M`. Format: integer + optional `K`/`M`/`G`, or `-1` for unlimited. |
 | `PHP_MAX_EXECUTION_TIME` | `30` | PHP `max_execution_time` in seconds; default `30`. `0` = unlimited. FPM `request_terminate_timeout` and nginx `fastcgi_read_timeout` derive from this. |
@@ -385,6 +392,256 @@ services:
 
 The container must have a route to those addresses, and any host or network firewall must allow the connection from Docker's bridge network or from the host when using host networking.
 
+### Upstream DNS Resolution
+
+By default nginx resolves a `proxy_pass` hostname **once, when the configuration
+loads**, and keeps that address forever. In Docker that is the wrong lifetime: a
+backend container restarts, gets a new IP, and the proxy keeps sending traffic
+to the old one until nginx itself is restarted.
+
+This image avoids that by emitting the upstream through a variable together with
+a `resolver`, so nginx re-resolves at request time:
+
+```nginx
+resolver 127.0.0.11 valid=5s;
+set $upstream_app_example_com http://app:3000;
+proxy_pass $upstream_app_example_com$request_uri;
+```
+
+`PROXY_RESOLVER` selects the resolver — `127.0.0.11` is Docker's embedded DNS and
+is the default — and `PROXY_RESOLVER_VALID` (default `5s`) is how long a resolved
+address is cached before it is looked up again. The same resolver is used for
+`TLS_TERMINATOR_PROXY` stream upstreams.
+
+Set `PROXY_RESOLVER=default` to omit the resolver directive entirely and use
+nginx's built-in startup-time resolution instead:
+
+```yaml
+environment:
+  PROXY_RESOLVER: "default"
+```
+
+That is the right choice when `127.0.0.11` does not exist — `network_mode: host`,
+a non-Docker runtime — or when every upstream is a literal IP address and DNS is
+not involved at all. Two consequences come with it:
+
+- **Startup becomes strict.** If an upstream hostname does not resolve when nginx
+  loads its configuration, nginx refuses to start. With a resolver configured the
+  proxy starts anyway and returns `502` until the backend appears.
+- **Addresses are never refreshed.** A backend that changes IP needs a restart of
+  this container to be picked up.
+
+## Streaming Responses (SSE)
+
+A normal reverse-proxy response is buffered by nginx and bounded by
+`PROXY_READ_TIMEOUT`. Both defaults are right for ordinary requests and wrong
+for a stream that is meant to stay open: the client sees nothing until the
+response ends — which for Server-Sent Events is never — and the connection is
+cut after 60 seconds.
+
+`PROXY_STREAM_PATHS` marks the endpoints where that trade should be reversed:
+
+```yaml
+environment:
+  PROXY_SITES: "app.example.com:http://app:3000/"
+  PROXY_STREAM_PATHS: "app.example.com:/events,app.example.com:/admapi/v1/live-stream:2h"
+```
+
+Each entry is `host:/path-prefix[:timeout]`. The timeout is optional and
+defaults to `10m`; it accepts the same forms as `PROXY_READ_TIMEOUT` (`30s`,
+`10m`, `1h`). For every entry the generated HTTPS server block gains one
+location:
+
+```nginx
+location ^~ /events {
+    # ... the same upstream and forwarded headers as location / ...
+    proxy_buffering                    off;
+    proxy_cache                        off;
+    gzip                               off;
+    proxy_read_timeout                 10m;
+    proxy_send_timeout                 10m;
+}
+```
+
+Everything else on the site is untouched. Ordinary responses keep their
+buffering and the global timeout, which is why this is a per-path opt-in rather
+than a per-site switch — turning buffering off for a whole site would slow every
+normal response on it for the sake of one endpoint.
+
+### Scope and rules
+
+- **Proxy sites only.** Static, static-php, redirect and TLS-terminator sites are
+  rejected at startup.
+- **A host may be a primary or an alias**; the location attaches to the owning
+  server block and covers every name it serves.
+- **`/` is not a valid path.** nginx treats `location ^~ /` and `location /` as
+  the same location and refuses to start, so it is rejected up front — as are
+  duplicate prefixes on one site.
+- **`BASIC_AUTH_FILES` still applies.** The generated location carries its own
+  `auth_basic`, so a streaming endpoint on an authenticated site stays
+  authenticated. `SITE_ALLOWED_IPS` applies too — it is enforced at server scope.
+- **Already using a `site-conf.d` snippet for this?** Remove it when you adopt
+  the variable. Two definitions of the same location make nginx refuse to start.
+
+### The `X-Accel-Buffering` alternative
+
+nginx honours an `X-Accel-Buffering: no` response header from the upstream and
+disables buffering for that one response. An application can therefore solve the
+buffering half of this on its own, without any proxy configuration:
+
+```
+Content-Type: text/event-stream
+X-Accel-Buffering: no
+```
+
+What it **cannot** do is extend the read timeout. A stream with that header set
+still dies at `PROXY_READ_TIMEOUT` — 60 seconds by default — the moment it stays
+idle that long. Use the header if you cannot change the proxy configuration; use
+`PROXY_STREAM_PATHS` if you can, and both together do no harm.
+
+### Send a heartbeat regardless
+
+A well-behaved SSE upstream should emit a comment line every 20–30 seconds even
+when it has nothing to say:
+
+```
+: ping
+
+```
+
+The timeout is a backstop for a wedged upstream, not a schedule to design
+against. A heartbeat also keeps intermediate proxies, load balancers and NAT
+tables from dropping an idle connection, none of which are governed by settings
+in this image.
+
+### Connection budget
+
+Every open stream holds a connection slot for its entire lifetime, and a
+**proxied** stream holds two — the client connection and the upstream
+connection both count. `worker_connections` is `1024` in this image's
+`nginx.conf` with no environment variable to change it, and because
+`worker_processes` is `auto` that limit is *per worker* rather than a total,
+with no guarantee that connections spread evenly across workers.
+
+For a console with a handful of operators this is a non-issue. It is still a
+shared resource: exhaust it and other sites on the same proxy stop accepting
+connections. If you expect many concurrent streams, budget for it — making
+`worker_connections` configurable is the natural follow-up when a real workload
+needs it.
+
+Note that HTTP/2 is already enabled on every generated HTTPS server block, so
+browsers multiplex streams over one connection and the traditional
+six-connections-per-origin limit does not apply.
+
+## TLS Terminator Proxies
+
+`PROXY_SITES` speaks HTTP: nginx parses the request, rewrites headers, and can
+buffer. Some backends need none of that — a database, a message broker, an SMTP
+or IMAP server, a game protocol. `TLS_TERMINATOR_PROXY` terminates TLS at the
+edge and forwards the **decrypted TCP stream** to the backend through the nginx
+`stream` module, with no HTTP parsing and no buffering:
+
+```yaml
+environment:
+  TLS_TERMINATOR_PROXY: "db.example.com:4343:postgres:5432,mq.example.com:5671:rabbitmq:5672"
+```
+
+Each entry is `host:listen_port:backend_host:backend_port[:proxy_protocol]`.
+
+### Every entry needs its own port
+
+This is the one rule that surprises people. HTTPS server blocks all share port
+443 and are told apart by SNI; the `stream` module has no such virtual hosting,
+so **a stream site is identified by its listen port alone**. Two entries cannot
+share a port, and startup refuses the configuration if they try. Ports are also
+checked against `HTTPS_PORT_OVERRIDE` and against port 443 when any HTTP site is
+using it.
+
+Publish the ports you configure:
+
+```yaml
+ports:
+  - "80:80"
+  - "443:443"
+  - "4343:4343"
+  - "5671:5671"
+```
+
+### Client addresses
+
+Because TLS is terminated here, the backend sees this container's address rather
+than the client's. Append `proxy_protocol` as a fifth field to prepend a PROXY
+protocol header to the connection:
+
+```yaml
+environment:
+  TLS_TERMINATOR_PROXY: "db.example.com:4343:postgres:5432:proxy_protocol"
+```
+
+The backend must be configured to expect it — a backend that does not understand
+PROXY protocol will treat the header as corrupt protocol data.
+
+### Certificates still work normally
+
+A TLS-terminator host is a site like any other: it gets its own SNI certificate,
+its aliases land in the certificate SANs, and it is issued and renewed by Let's
+Encrypt exactly as an HTTPS site is. That works because the host still gets a
+plain **HTTP server block on port 80** for `/.well-known/acme-challenge/`, which
+also 302-redirects everything else to `https://<host>:<listen_port>`.
+
+### What does not apply
+
+A stream block has no HTTP layer, so anything expressed in HTTP terms is refused
+at startup rather than silently ignored:
+
+| Variable | On a TLS-terminator site |
+|---|---|
+| `BASIC_AUTH_FILES` | Rejected — no HTTP layer to send `401` |
+| `SITE_ALLOWED_IPS` | Rejected — no HTTP layer to return `403` |
+| `HTTPS_PORT_OVERRIDE` | Rejected — the listen port is already explicit |
+| `DEFAULT_SITE` | Rejected — cannot be a fallback for unknown HTTP hosts |
+| `PROXY_STREAM_PATHS` | Rejected — there are no paths at layer 4 |
+
+`PROXY_READ_TIMEOUT` and `PROXY_SEND_TIMEOUT` do apply, as the stream's
+`proxy_timeout` and `proxy_connect_timeout`.
+
+Generated stream configs live in `/etc/nginx/stream.d/nginx-auto-tls-proxy-<host>.conf`.
+
+## Non-Standard HTTPS Ports
+
+`HTTPS_PORT_OVERRIDE` serves selected hosts on an HTTPS port other than 443:
+
+```yaml
+environment:
+  STATIC_SITES: "example.com"
+  PROXY_SITES: "admin.example.com:http://admin:3000/"
+  HTTPS_PORT_OVERRIDE: "admin.example.com:4444"
+ports:
+  - "80:80"
+  - "443:443"
+  - "4444:4444"
+```
+
+`example.com` stays on 443; `admin.example.com` is served **only** on 4444 and is
+no longer reachable on 443. Several hosts may share one override port — unlike
+`TLS_TERMINATOR_PROXY`, these are ordinary HTTPS server blocks and SNI still
+tells them apart.
+
+Details worth knowing:
+
+- **Port 80 is rejected**, and `443` is accepted but does nothing.
+- **The port propagates.** HTTP→HTTPS redirects for that host go to
+  `https://host:4444/…`, and a `SITE_REDIRECTS` entry pointing at it redirects to
+  its real port.
+- **Aliases follow their primary.** An override written against an alias applies
+  to the whole server block, and conflicting ports within one block are rejected.
+- **ACME is unaffected.** Challenges are served on port 80 regardless, so Let's
+  Encrypt works for hosts on non-standard ports — provided port 80 is reachable
+  from the internet.
+- **The 443 catch-all disappears** when no site uses 443. Normally an
+  `ssl_reject_handshake` default server answers unknown SNI on 443; with every
+  site moved off that port, nothing listens there at all.
+
 ## TLS And Certificates
 
 On startup, every configured primary site gets a certificate path:
@@ -643,7 +900,7 @@ Advanced per-site snippets can be mounted under:
 /etc/nginx/site-conf.d/<site>/*.conf
 ```
 
-Generated config files are named `/etc/nginx/conf.d/nginx-auto-tls-proxy-*.conf`; other mounted `.conf` files are not removed on startup.
+Generated config files are named `/etc/nginx/conf.d/nginx-auto-tls-proxy-*.conf`, and `/etc/nginx/stream.d/nginx-auto-tls-proxy-*.conf` for `TLS_TERMINATOR_PROXY` sites; other mounted `.conf` files are not removed on startup.
 
 ## Build
 

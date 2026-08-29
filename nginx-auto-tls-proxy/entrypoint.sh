@@ -55,6 +55,19 @@ is_safe_url() {
     [[ "$url" =~ ^https?://[^[:space:]\;\"\`\$]+$ ]]
 }
 
+# True when a PROXY_SITES upstream URL carries a path of its own, i.e. anything
+# after host[:port] beyond a bare trailing slash. `http://b:3000/` and
+# `http://b:3000` have no path; `http://b:3000/api/` does. Used by
+# PROXY_STREAM_PATHS, where a path-carrying upstream cannot be reproduced inside
+# a prefix location without a resolver.
+proxy_url_has_path() {
+    local url="$1"
+    local rest="${url#*://}"
+    [[ "$rest" == */* ]] || return 1
+    [[ "/${rest#*/}" == "/" ]] && return 1
+    return 0
+}
+
 is_safe_size() {
     [[ "$1" =~ ^[0-9]+[kKmMgG]?$ ]]
 }
@@ -296,6 +309,8 @@ declare -A REDIRECT_MAP=()
 declare -A REDIRECT_MODE_MAP=()
 declare -A SITE_REWRITES_MAP=()
 declare -A SITE_ALLOWED_IPS_MAP=()
+declare -A PROXY_STREAM_MAP=()
+declare -A PROXY_STREAM_SEEN=()
 declare -A SITE_ALIASES_MAP=()
 declare -A STATIC_ROOT_MAP=()
 declare -A ALL_SITE_MAP=()
@@ -720,6 +735,61 @@ PHP_UPLOAD_LIMIT="$(nginx_size_to_php "$CLIENT_MAX_BODY_SIZE")"
 PHP_REQUEST_TERMINATE_TIMEOUT=$((PHP_MAX_EXECUTION_TIME + 5))
 FASTCGI_READ_TIMEOUT_SECONDS=$((PHP_MAX_EXECUTION_TIME + 30))
 
+# Long-lived streaming paths: PROXY_STREAM_PATHS=host:/path[:timeout],...
+# Comma-separated `host:/path-prefix[:timeout]` entries. The host is everything
+# before the FIRST colon; the optional timeout is everything after the LAST one
+# (unambiguous because is_safe_path forbids colons in the path). Each entry adds
+# one `location ^~ <path>` to that site's HTTPS block with response buffering
+# disabled and its own read/send timeouts, so a Server-Sent Events stream is
+# delivered as it is produced instead of being buffered until the response ends
+# (which for SSE never happens) and cut by the global PROXY_READ_TIMEOUT.
+#
+# Parsed here rather than beside the other per-site variables because the
+# PROXY_RESOLVER validation below needs the resolved resolver mode.
+if [[ -n "${PROXY_STREAM_PATHS:-}" ]]; then
+    IFS=',' read -ra _parts <<< "$PROXY_STREAM_PATHS"
+    for _p in "${_parts[@]}"; do
+        _p="$(trim_spaces "$_p")"
+        [[ -z "$_p" ]] && continue
+        [[ "$_p" == *:* ]] || die "Malformed PROXY_STREAM_PATHS entry, expected host:/path[:timeout]: $_p"
+        _ps_host="$(lower "$(trim_spaces "${_p%%:*}")")"
+        _ps_rest="$(trim_spaces "${_p#*:}")"
+        if [[ "$_ps_rest" == *:* ]]; then
+            _ps_path="$(trim_spaces "${_ps_rest%:*}")"
+            _ps_timeout="$(trim_spaces "${_ps_rest##*:}")"
+        else
+            _ps_path="$_ps_rest"
+            _ps_timeout="10m"
+        fi
+        require_hostname "$_ps_host" "PROXY_STREAM_PATHS"
+        [[ "${SERVER_NAME_OWNER["$_ps_host"]+isset}" == "isset" ]] \
+            || die "PROXY_STREAM_PATHS host must be a configured site or alias: $_ps_host"
+        _ps_owner="${SERVER_NAME_OWNER["$_ps_host"]}"
+        _ps_mode="$(site_mode "$_ps_owner")"
+        [[ "$_ps_mode" == "proxy" ]] \
+            || die "PROXY_STREAM_PATHS is only valid for PROXY_SITES; $_ps_host resolves to $_ps_owner (mode=$_ps_mode)"
+        is_safe_path "$_ps_path" \
+            || die "PROXY_STREAM_PATHS path must be an absolute path containing only letters, numbers, dot, dash, underscore, and slash: $_ps_path (in $_p)"
+        # nginx treats `location ^~ /` and `location /` as the same location and
+        # refuses to start, so '/' has to be rejected here rather than at nginx -t.
+        [[ "$_ps_path" == "/" ]] \
+            && die "PROXY_STREAM_PATHS path must be more specific than '/' (in $_p); nginx treats 'location ^~ /' and 'location /' as the same location"
+        is_safe_duration "$_ps_timeout" \
+            || die "PROXY_STREAM_PATHS timeout must look like 30s, 10m, or 1h; got: $_ps_timeout (in $_p)"
+        [[ "${PROXY_STREAM_SEEN["$_ps_owner|$_ps_path"]+isset}" == "isset" ]] \
+            && die "Duplicate PROXY_STREAM_PATHS path for $_ps_owner: $_ps_path (nginx rejects duplicate locations)"
+        # With PROXY_RESOLVER=default the generated proxy_pass carries a URI, and
+        # inside a prefix location nginx substitutes that URI for the matched
+        # prefix — so an upstream with a path of its own cannot be reproduced
+        # faithfully. Refuse rather than silently route the stream somewhere else.
+        if [[ "$PROXY_RESOLVER" == "default" ]] && proxy_url_has_path "${PROXY_MAP["$_ps_owner"]}"; then
+            die "PROXY_STREAM_PATHS on $_ps_owner needs a resolver: with PROXY_RESOLVER=default and an upstream that carries a path (${PROXY_MAP["$_ps_owner"]}), a prefix location would rewrite the upstream path. Set PROXY_RESOLVER to a resolver address (e.g. 127.0.0.11), or point the upstream at the host root."
+        fi
+        PROXY_STREAM_SEEN["$_ps_owner|$_ps_path"]=1
+        PROXY_STREAM_MAP["$_ps_owner"]="${PROXY_STREAM_MAP["$_ps_owner"]:-}$_ps_path $_ps_timeout"$'\n'
+    done
+fi
+
 log "Sites: ${ALL_SITES[*]:-<none>}"
 
 # Prepare static roots and placeholder content (for both static and static-php sites).
@@ -965,14 +1035,23 @@ NGINXEOF
         local var_slug="${site//[^a-zA-Z0-9]/_}"
         local resolver_lines=""
         local proxy_pass_lines=""
+        # proxy_pass for PROXY_STREAM_PATHS locations. It cannot always be the
+        # same string as location /'s: inside a prefix location nginx replaces
+        # the matched prefix with the proxy_pass URI, so a form carrying a URI
+        # would rewrite the path. The $request_uri form is already immune; the
+        # resolver-less form is made immune by dropping the URI entirely, which
+        # makes nginx forward the client's URI untouched.
+        local stream_proxy_pass_lines=""
         if [[ "$PROXY_RESOLVER" != "default" ]]; then
             local _proxy_var_url="${proxy_url%/}"
             resolver_lines="        resolver $PROXY_RESOLVER valid=$PROXY_RESOLVER_VALID;
         resolver_timeout 3s;"
             proxy_pass_lines="        set \$upstream_${var_slug} ${_proxy_var_url};
         proxy_pass \$upstream_${var_slug}\$request_uri;"
+            stream_proxy_pass_lines="$proxy_pass_lines"
         else
             proxy_pass_lines="        proxy_pass $proxy_url;"
+            stream_proxy_pass_lines="        proxy_pass ${proxy_url%/};"
         fi
         cat >> "$conf" <<NGINXEOF
 server {
@@ -1001,8 +1080,47 @@ $proxy_pass_lines
         proxy_read_timeout                 $PROXY_READ_TIMEOUT;
         proxy_send_timeout                 $PROXY_SEND_TIMEOUT;
     }
-}
 NGINXEOF
+        # Streaming locations (PROXY_STREAM_PATHS). Appended after location /
+        # rather than substituted into the block above, so that a site without
+        # stream paths produces byte-identical config to before this feature
+        # existed. Prefix locations match by longest prefix regardless of the
+        # order they appear in the file, so position carries no meaning.
+        #
+        # The proxy body is duplicated rather than shared with location / on
+        # purpose: proxy_pass legitimately differs between the two, and
+        # auth_basic MUST be repeated because nginx_auth_lines is emitted at
+        # location scope — a stream location that omitted it would be an
+        # unauthenticated hole in a site that is otherwise behind basic auth.
+        # (The server-scope SITE_ALLOWED_IPS allow/deny list, by contrast, is
+        # inherited here automatically.) tests/smoke.sh pins both properties.
+        if [[ "${PROXY_STREAM_MAP["$site"]+isset}" == "isset" ]]; then
+            local _sp_path _sp_timeout
+            while read -r _sp_path _sp_timeout; do
+                [[ -z "$_sp_path" ]] && continue
+                cat >> "$conf" <<NGINXEOF
+
+    location ^~ $_sp_path {
+$(nginx_auth_lines "$site")
+$resolver_lines
+$stream_proxy_pass_lines
+        proxy_http_version 1.1;
+        proxy_set_header Host              \$http_host;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Port  \$server_port;
+        proxy_set_header Upgrade           \$http_upgrade;
+        proxy_set_header Connection        \$connection_upgrade;
+        proxy_buffering                    off;
+        proxy_cache                        off;
+        gzip                               off;
+        proxy_read_timeout                 $_sp_timeout;
+        proxy_send_timeout                 $_sp_timeout;
+    }
+NGINXEOF
+            done <<< "${PROXY_STREAM_MAP["$site"]}"
+        fi
+        printf '}\n' >> "$conf"
     elif [[ "$mode" == "static-php" ]]; then
         local site_root
         site_root="$(site_static_root "$site")"
@@ -1113,7 +1231,11 @@ print_startup_summary() {
         if [[ "${SITE_ALLOWED_IPS_MAP["$site"]+isset}" == "isset" ]]; then
             _ip_info=" allowed-ips=$(grep -c . <<< "${SITE_ALLOWED_IPS_MAP["$site"]}")"
         fi
-        log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")${_port_info}${_rw_info}${_ip_info}"
+        local _sp_info=""
+        if [[ "${PROXY_STREAM_MAP["$site"]+isset}" == "isset" ]]; then
+            _sp_info=" stream-paths=$(grep -c . <<< "${PROXY_STREAM_MAP["$site"]}")"
+        fi
+        log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")${_port_info}${_rw_info}${_ip_info}${_sp_info}"
     done
 }
 
