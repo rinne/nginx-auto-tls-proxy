@@ -8,6 +8,7 @@ Self-contained nginx reverse proxy container with automatic per-site TLS, Let's 
 
 - Static sites from `/sites/<domain>` or a custom mounted htdocs root.
 - Reverse proxy sites with WebSocket upgrade headers.
+- Optional per-site **HTTP/3 (QUIC)** alongside HTTP/2.
 - Long-lived streaming (SSE) endpoints with per-path buffering and timeout control.
 - L4 TLS termination for non-HTTP backends via the nginx `stream` module.
 - **Optional PHP-enabled static sites** via the separate `:<ver>-php` image tag.
@@ -115,6 +116,8 @@ docker compose -f dc/try/docker-compose.yaml down -v
 | `PROXY_RESOLVER` | `127.0.0.11` | DNS resolver used for proxy and stream upstreams; default `127.0.0.11` (Docker's embedded DNS). `default` omits the resolver directive and falls back to nginx's startup-time resolution. See [Upstream DNS Resolution](#upstream-dns-resolution). |
 | `PROXY_RESOLVER_VALID` | `5s` | How long nginx caches a resolved upstream address; default `5s`. Ignored when `PROXY_RESOLVER=default`. |
 | `HTTPS_PORT_OVERRIDE` | `admin.example.com:4444` | Comma-separated `host:port` pairs serving specific hosts on a non-443 HTTPS port. Port `80` is rejected; `443` is a no-op. See [Non-Standard HTTPS Ports](#non-standard-https-ports). |
+| `HTTP3_SITES` | `app.example.com,www.example.com` | Comma-separated hostnames to serve over HTTP/3 (QUIC) in addition to HTTP/2. `*` enables every eligible site; empty or unset disables HTTP/3 entirely. **Requires publishing the UDP port.** See [HTTP/3](#http3-quic). |
+| `STRICT_SNI` | `1` | Reject connections whose SNI matches no configured site, on every HTTPS port. Default `1`. `0` restores the pre-0.10.0 behaviour where `HTTPS_PORT_OVERRIDE` ports served the first site instead. See [Unknown Hostnames](#unknown-hostnames-strict_sni). |
 | `PHP_FPM_PROFILE` | `M` | One of `S`, `M`, `L`, `XL`, `XXL` (case-insensitive). FPM pool sizing profile; default `M`. See [PHP-Enabled Sites](#php-enabled-sites). |
 | `PHP_MEMORY_LIMIT` | `128M` | PHP `memory_limit`; default `128M`. Format: integer + optional `K`/`M`/`G`, or `-1` for unlimited. |
 | `PHP_MAX_EXECUTION_TIME` | `30` | PHP `max_execution_time` in seconds; default `30`. `0` = unlimited. FPM `request_terminate_timeout` and nginx `fastcgi_read_timeout` derive from this. |
@@ -641,6 +644,105 @@ Details worth knowing:
 - **The 443 catch-all disappears** when no site uses 443. Normally an
   `ssl_reject_handshake` default server answers unknown SNI on 443; with every
   site moved off that port, nothing listens there at all.
+
+## HTTP/3 (QUIC)
+
+The image's nginx is built with `--with-http_v3_module` against OpenSSL 3.5, so
+HTTP/3 needs no separate build. It is off by default and enabled per site:
+
+```yaml
+environment:
+  STATIC_SITES: "example.com"
+  PROXY_SITES: "app.example.com:http://app:3000/"
+  HTTP3_SITES: "example.com,app.example.com"
+ports:
+  - "80:80"
+  - "443:443"
+  - "443:443/udp"     # REQUIRED - see below
+```
+
+`HTTP3_SITES` accepts a comma-separated host list, `*` for every eligible site,
+or an empty value which is identical to leaving the variable out. A host may be
+a primary or an alias and enables the whole server block. HTTP/2 is unaffected
+and stays enabled everywhere — HTTP/3 is strictly additive.
+
+### Publish the UDP port, or nothing happens
+
+HTTP/3 runs over UDP. `- "443:443"` in Compose publishes **TCP only**, so
+without the `/udp` line the QUIC listener is unreachable from outside the
+container. Nothing breaks visibly: browsers try HTTP/3 once, get no answer, and
+silently keep using HTTP/2 forever. If you enabled HTTP/3 and cannot tell
+whether it works, check this first.
+
+With `network_mode: host` there is nothing to publish and it works as-is.
+
+### How a browser actually reaches HTTP/3
+
+A browser cannot know a site speaks HTTP/3 until it is told, so every generated
+HTTP/3 site advertises it on its ordinary HTTPS responses:
+
+```
+Alt-Svc: h3=":443"; ma=86400
+```
+
+The first request to a site is therefore always HTTP/2; subsequent ones may use
+HTTP/3 for the next day. The advertised port always matches the port the site is
+actually served on, including under `HTTPS_PORT_OVERRIDE`.
+
+To confirm it works, use a client that supports HTTP/3 — note that many system
+curl builds do not, so check `curl -V | grep HTTP3` first:
+
+```bash
+curl -I --http3-only https://example.com/
+```
+
+### Scope and rules
+
+- **Not for TLS-terminator sites.** `TLS_TERMINATOR_PROXY` is layer 4 with no
+  HTTP layer. Naming one in `HTTP3_SITES` is a startup error; `*` skips them.
+- **`*` may not be combined** with explicit entries — it already means all.
+- **TLS 1.3 only**, which the image already requires; HTTP/3 has no TLS 1.2 mode.
+- **`reuseport` is handled for you.** nginx allows it on only one listener per
+  port and QUIC needs it, so the generated catch-all owns it. Do not add a `quic`
+  listener in a `site-conf.d` snippet — a second `reuseport` makes nginx refuse
+  to start, and one without it makes QUIC handshakes fail intermittently.
+- **Connection budget applies as it does for streaming** — see
+  [Connection budget](#connection-budget).
+
+## Unknown Hostnames (`STRICT_SNI`)
+
+When a TLS connection arrives whose SNI matches no configured site — or carries
+no SNI at all, as when you connect to a bare IP address — nginx has to decide
+what to serve. Since `STRICT_SNI` defaults to `1`, the answer is: nothing. Every
+HTTPS port gets a catch-all that refuses the handshake.
+
+```yaml
+environment:
+  STRICT_SNI: "1"   # default
+```
+
+Port 443 has always behaved this way. What changed in 0.10.0 is that
+`HTTPS_PORT_OVERRIDE` ports now behave the same. Previously they had no
+catch-all, so an unknown hostname on such a port was served by whichever site's
+config file sorted first — along with that site's certificate.
+
+**This can break bare-IP access.** If you reach an admin site as
+`https://10.0.0.5:4444/` with no hostname, that now fails. Use the hostname, or
+opt out:
+
+```yaml
+environment:
+  STRICT_SNI: "0"   # pre-0.10.0 behaviour
+```
+
+`STRICT_SNI=0` restores the old behaviour exactly: port 443 still rejects
+unknown SNI, override ports fall through to the first site.
+
+One wrinkle if you combine `STRICT_SNI=0` with `HTTP3_SITES`: only sites with
+HTTP/3 enabled have a QUIC listener, so an unknown hostname falls through to the
+first site over HTTP/2 but to the first *HTTP/3* site over HTTP/3 — which may be
+a different site. Startup warns when this applies. The default `STRICT_SNI=1`
+has no such asymmetry, since both protocols simply refuse.
 
 ## TLS And Certificates
 

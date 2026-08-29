@@ -136,6 +136,10 @@ nginx_size_to_php() {
     fi
 }
 
+site_has_http3() {
+    [[ "${HTTP3_SITE_MAP["$1"]+isset}" == "isset" ]]
+}
+
 site_exists() {
     [[ "${ALL_SITE_MAP["$1"]+isset}" == "isset" ]]
 }
@@ -311,6 +315,9 @@ declare -A SITE_REWRITES_MAP=()
 declare -A SITE_ALLOWED_IPS_MAP=()
 declare -A PROXY_STREAM_MAP=()
 declare -A PROXY_STREAM_SEEN=()
+declare -A HTTP3_SITE_MAP=()
+declare -A HTTP3_PORTS=()
+declare -A HTTP3_REUSEPORT_SITE=()
 declare -A SITE_ALIASES_MAP=()
 declare -A STATIC_ROOT_MAP=()
 declare -A ALL_SITE_MAP=()
@@ -695,6 +702,7 @@ PROXY_READ_TIMEOUT="${PROXY_READ_TIMEOUT:-60s}"
 PROXY_SEND_TIMEOUT="${PROXY_SEND_TIMEOUT:-60s}"
 HSTS_MAX_AGE="${HSTS_MAX_AGE:-0}"
 OCSP_STAPLING="${OCSP_STAPLING:-0}"
+STRICT_SNI="${STRICT_SNI:-1}"
 STATIC_FALLBACK_PAGES="${STATIC_FALLBACK_PAGES:-0}"
 PROXY_RESOLVER="${PROXY_RESOLVER:-127.0.0.11}"
 PROXY_RESOLVER_VALID="${PROXY_RESOLVER_VALID:-5s}"
@@ -717,6 +725,7 @@ is_safe_duration "$PROXY_READ_TIMEOUT" || die "PROXY_READ_TIMEOUT must look like
 is_safe_duration "$PROXY_SEND_TIMEOUT" || die "PROXY_SEND_TIMEOUT must look like 60s, 5m, or 1h"
 [[ "$HSTS_MAX_AGE" =~ ^[0-9]+$ ]] || die "HSTS_MAX_AGE must be a non-negative integer"
 [[ "$OCSP_STAPLING" == "0" || "$OCSP_STAPLING" == "1" ]] || die "OCSP_STAPLING must be 0 or 1"
+[[ "$STRICT_SNI" == "0" || "$STRICT_SNI" == "1" ]] || die "STRICT_SNI must be 0 or 1"
 [[ "$STATIC_FALLBACK_PAGES" == "0" || "$STATIC_FALLBACK_PAGES" == "1" ]] || die "STATIC_FALLBACK_PAGES must be 0 or 1"
 [[ "$REAL_IP_HEADER" =~ ^[A-Za-z0-9-]+$ ]] || die "REAL_IP_HEADER must be an HTTP header name"
 is_positive_int "$LETSENCRYPT_RENEW_INTERVAL_SECONDS" || die "LETSENCRYPT_RENEW_INTERVAL_SECONDS must be a positive integer"
@@ -787,6 +796,60 @@ if [[ -n "${PROXY_STREAM_PATHS:-}" ]]; then
         fi
         PROXY_STREAM_SEEN["$_ps_owner|$_ps_path"]=1
         PROXY_STREAM_MAP["$_ps_owner"]="${PROXY_STREAM_MAP["$_ps_owner"]:-}$_ps_path $_ps_timeout"$'\n'
+    done
+fi
+
+# HTTP/3: HTTP3_SITES=host1,host2 | '*' (every eligible site) | '' (disabled).
+# An empty value is identical to the variable being absent. A host may be a
+# primary or an alias and resolves to the owning server block. '*' skips
+# TLS-terminator sites silently -- they are layer 4 and have no HTTP layer --
+# whereas naming one explicitly is an error, since that asks for something
+# impossible rather than "everything that can".
+HTTP3_SITES_RAW="$(trim_spaces "${HTTP3_SITES:-}")"
+if [[ -n "$HTTP3_SITES_RAW" ]]; then
+    nginx -V 2>&1 | grep -q 'http_v3_module' \
+        || die "HTTP3_SITES is set but this nginx build has no HTTP/3 support (--with-http_v3_module is absent)"
+    if [[ "$HTTP3_SITES_RAW" == "*" ]]; then
+        for _site in "${ALL_SITES[@]}"; do
+            [[ "$(site_mode "$_site")" == "tls-terminator" ]] && continue
+            HTTP3_SITE_MAP["$_site"]=1
+        done
+    else
+        [[ "$HTTP3_SITES_RAW" == *"*"* ]] \
+            && die "HTTP3_SITES '*' selects every site and cannot be combined with other entries; got: $HTTP3_SITES_RAW"
+        IFS=',' read -ra _parts <<< "$HTTP3_SITES_RAW"
+        for _p in "${_parts[@]}"; do
+            _h3_host="$(lower "$(trim_spaces "$_p")")"
+            [[ -z "$_h3_host" ]] && continue
+            require_hostname "$_h3_host" "HTTP3_SITES"
+            [[ "${SERVER_NAME_OWNER["$_h3_host"]+isset}" == "isset" ]] \
+                || die "HTTP3_SITES host must be a configured site or alias: $_h3_host"
+            _h3_owner="${SERVER_NAME_OWNER["$_h3_host"]}"
+            [[ "$(site_mode "$_h3_owner")" == "tls-terminator" ]] \
+                && die "HTTP3_SITES cannot be used with TLS_TERMINATOR_PROXY site: $_h3_owner (HTTP/3 is an HTTP-layer protocol; stream sites have no HTTP layer)"
+            HTTP3_SITE_MAP["$_h3_owner"]=1
+        done
+    fi
+    for _site in "${!HTTP3_SITE_MAP[@]}"; do
+        HTTP3_PORTS["$(site_https_port "$_site")"]=1
+    done
+fi
+
+# `reuseport` may appear on only one listen directive per address:port, and QUIC
+# needs it: without it the workers share one UDP socket and packets land on
+# workers that do not hold the connection, so handshakes stall intermittently.
+# Normally the per-port catch-all owns it. With STRICT_SNI=0 there is no
+# catch-all on HTTPS_PORT_OVERRIDE ports, so the first HTTP/3 site on such a
+# port carries it instead -- and unknown-SNI fall-through then differs between
+# HTTP/2 and HTTP/3, which we say out loud.
+if [[ "$STRICT_SNI" != "1" && ${#HTTP3_SITE_MAP[@]} -gt 0 ]]; then
+    for _site in "${ALL_SITES[@]}"; do
+        site_has_http3 "$_site" || continue
+        _h3_port="$(site_https_port "$_site")"
+        [[ "$_h3_port" == "443" ]] && continue
+        [[ "${HTTP3_REUSEPORT_SITE["$_h3_port"]+isset}" == "isset" ]] && continue
+        HTTP3_REUSEPORT_SITE["$_h3_port"]="$_site"
+        warn "STRICT_SNI=0 and HTTP/3 on port $_h3_port: an unknown SNI falls through to the first site on that port over HTTP/2, but to $_site over HTTP/3. STRICT_SNI=1 (the default) rejects unknown SNI on both."
     done
 fi
 
@@ -959,6 +1022,17 @@ generate_site_config() {
     local site_port
     site_port="$(site_https_port "$site")"
 
+    # HTTP/3 fragments. Both carry their own trailing newline and are
+    # interpolated at the start of an existing line, so a site without HTTP/3
+    # yields byte-identical output to before the feature existed.
+    local _h3_listen="" _h3_altsvc=""
+    if site_has_http3 "$site"; then
+        local _h3_rp=""
+        [[ "${HTTP3_REUSEPORT_SITE["$site_port"]:-}" == "$site" ]] && _h3_rp=" reuseport"
+        _h3_listen="    listen $site_port quic${_h3_rp};"$'\n'"    http3 on;"$'\n'
+        _h3_altsvc="    add_header Alt-Svc 'h3=\":$site_port\"; ma=86400' always;"$'\n'
+    fi
+
     for alias in $(site_aliases "$site"); do
         server_names="$server_names $alias"
     done
@@ -1011,8 +1085,8 @@ NGINXEOF
         cat >> "$conf" <<NGINXEOF
 server {
     listen $site_port ssl;
-    http2 on;
-    server_name $server_names;
+${_h3_listen}    http2 on;
+${_h3_altsvc}    server_name $server_names;
 
     ssl_certificate     /ssl/$site/ssl.crt;
     ssl_certificate_key /ssl/$site/ssl.key;
@@ -1056,8 +1130,8 @@ NGINXEOF
         cat >> "$conf" <<NGINXEOF
 server {
     listen $site_port ssl;
-    http2 on;
-    server_name $server_names;
+${_h3_listen}    http2 on;
+${_h3_altsvc}    server_name $server_names;
 
     ssl_certificate     /ssl/$site/ssl.crt;
     ssl_certificate_key /ssl/$site/ssl.key;
@@ -1127,8 +1201,8 @@ NGINXEOF
         cat >> "$conf" <<NGINXEOF
 server {
     listen $site_port ssl;
-    http2 on;
-    server_name $server_names;
+${_h3_listen}    http2 on;
+${_h3_altsvc}    server_name $server_names;
 
     ssl_certificate     /ssl/$site/ssl.crt;
     ssl_certificate_key /ssl/$site/ssl.key;
@@ -1171,8 +1245,8 @@ NGINXEOF
         cat >> "$conf" <<NGINXEOF
 server {
     listen $site_port ssl;
-    http2 on;
-    server_name $server_names;
+${_h3_listen}    http2 on;
+${_h3_altsvc}    server_name $server_names;
 
     ssl_certificate     /ssl/$site/ssl.crt;
     ssl_certificate_key /ssl/$site/ssl.key;
@@ -1235,7 +1309,9 @@ print_startup_summary() {
         if [[ "${PROXY_STREAM_MAP["$site"]+isset}" == "isset" ]]; then
             _sp_info=" stream-paths=$(grep -c . <<< "${PROXY_STREAM_MAP["$site"]}")"
         fi
-        log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")${_port_info}${_rw_info}${_ip_info}${_sp_info}"
+        local _h3_info=""
+        site_has_http3 "$site" && _h3_info=" http3=on"
+        log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")${_port_info}${_rw_info}${_ip_info}${_sp_info}${_h3_info}"
     done
 }
 
@@ -1356,20 +1432,52 @@ cat >> /etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf <<'NGINXEOF'
 }
 NGINXEOF
 
-_has_port_443=0
+# HTTPS ports actually in use by HTTP-layer sites (TLS terminators live in the
+# stream module and are not part of this).
+declare -A _https_ports_used=()
 for _site in "${ALL_SITES[@]}"; do
     [[ "${TLS_TERM_MAP["$_site"]+isset}" == "isset" ]] && continue
-    [[ "$(site_https_port "$_site")" == "443" ]] && { _has_port_443=1; break; }
+    _https_ports_used["$(site_https_port "$_site")"]=1
 done
+_has_port_443=0
+[[ "${_https_ports_used[443]+isset}" == "isset" ]] && _has_port_443=1
+
+# The catch-all rejects unknown SNI, and when HTTP/3 is enabled on the port it
+# also owns the single permitted `reuseport`.
+_default_quic_443=""
+[[ "${HTTP3_PORTS[443]+isset}" == "isset" ]] \
+    && _default_quic_443="    listen 443 quic reuseport default_server;"$'\n'
 if [[ "$_has_port_443" == "1" || ${#ALL_SITES[@]} -eq 0 ]]; then
-    cat >> /etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf <<'NGINXEOF'
+    cat >> /etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf <<NGINXEOF
 
 server {
     listen 443 ssl default_server;
-    server_name _;
+${_default_quic_443}    server_name _;
     ssl_reject_handshake on;
 }
 NGINXEOF
+fi
+
+# STRICT_SNI (default 1) extends the same treatment to HTTPS_PORT_OVERRIDE
+# ports, which historically had no catch-all at all: a request carrying an
+# unknown SNI -- or none, as when connecting by bare IP -- was served by
+# whichever site's config file sorted first, together with that site's
+# certificate. STRICT_SNI=0 restores that older behaviour.
+if [[ "$STRICT_SNI" == "1" ]]; then
+    for _port in $(printf '%s\n' "${!_https_ports_used[@]}" | sort -n); do
+        [[ "$_port" == "443" ]] && continue
+        _default_quic_port=""
+        [[ "${HTTP3_PORTS["$_port"]+isset}" == "isset" ]] \
+            && _default_quic_port="    listen $_port quic reuseport default_server;"$'\n'
+        cat >> /etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf <<NGINXEOF
+
+server {
+    listen $_port ssl default_server;
+${_default_quic_port}    server_name _;
+    ssl_reject_handshake on;
+}
+NGINXEOF
+    done
 fi
 
 generate_real_ip_config

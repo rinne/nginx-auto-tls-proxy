@@ -18,6 +18,9 @@ cleanup() {
     if [[ -n "${STREAM_COMPOSE_FILE:-}" && -f "$STREAM_COMPOSE_FILE" ]]; then
         "${STREAM_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
     fi
+    if [[ -n "${H3_COMPOSE_FILE:-}" && -f "$H3_COMPOSE_FILE" ]]; then
+        "${H3_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+    fi
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -403,6 +406,129 @@ b=$(awk "/^    location \^~ \/events \{/,/^    \}/" "$conf" | grep proxy_set_hea
 
 "${STREAM_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 
+
+# --- HTTP3_SITES + STRICT_SNI: live HTTP/3 (own compose substack) ---
+# HTTP/3 assertions must run from INSIDE the container: the image's curl is
+# built with HTTP3, but the host's curl frequently is not (macOS, most Linux
+# distro builds). Running in-container also means the test needs no published
+# UDP port.
+H3_HTTPS_PORT="${H3_HTTPS_PORT:-18445}"
+H3_ALT_PORT="${H3_ALT_PORT:-18446}"
+H3_COMPOSE_FILE="$TMP_DIR/docker-compose-h3.yaml"
+
+cat > "$H3_COMPOSE_FILE" <<EOF
+services:
+  proxy:
+    build:
+      context: "$ROOT_DIR/nginx-auto-tls-proxy"
+    ports:
+      - "127.0.0.1:$H3_HTTPS_PORT:443"
+      - "127.0.0.1:$H3_ALT_PORT:4444"
+    volumes:
+      - "$TMP_DIR/ssl-h3:/ssl"
+    environment:
+      STATIC_SITES: "h3.local,alt.local,plain.local"
+      HTTPS_PORT_OVERRIDE: "alt.local:4444"
+      HTTP3_SITES: "h3.local,alt.local"
+      LETSENCRYPT_EMAIL: ""
+EOF
+
+H3_PROJECT="$(basename "$TMP_DIR" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')h3"
+if command -v docker-compose >/dev/null 2>&1; then
+    H3_COMPOSE=(docker-compose -p "$H3_PROJECT" -f "$H3_COMPOSE_FILE")
+else
+    H3_COMPOSE=(docker compose -p "$H3_PROJECT" -f "$H3_COMPOSE_FILE")
+fi
+
+"${H3_COMPOSE[@]}" up -d --build
+
+for _ in $(seq 1 30); do
+    if "${H3_COMPOSE[@]}" exec -T proxy /usr/local/bin/healthcheck.sh >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+"${H3_COMPOSE[@]}" exec -T proxy /usr/local/bin/healthcheck.sh
+
+# The image's curl must actually support HTTP/3, or every assertion below would
+# "pass" as a false negative.
+"${H3_COMPOSE[@]}" exec -T proxy curl -V | grep -q 'HTTP3' \
+    || { printf 'FAIL: the image curl has no HTTP3 support; the h3 assertions would be meaningless\n'; exit 1; }
+
+# How many of N forced-h3 attempts succeed. Repeated rather than single-shot:
+# QUIC without `reuseport` fails intermittently rather than outright, and a
+# one-attempt test would mostly pass while the config was broken.
+h3_ok() {
+    local host="$1" port="$2" tries="${3:-3}"
+    "${H3_COMPOSE[@]}" exec -T proxy sh -c "
+        ok=0
+        for i in \$(seq 1 $tries); do
+            c=\$(curl -ksS --http3-only -m 6 -o /dev/null -w '%{http_code}' \
+                 --resolve $host:$port:127.0.0.1 https://$host:$port/ 2>/dev/null)
+            [ \"\$c\" = 200 ] && ok=\$((ok+1))
+        done
+        printf '%s' \"\$ok\"" 2>/dev/null | tr -d '\r'
+}
+
+# 1. HTTP/3 is actually negotiated, on 443 and on an HTTPS_PORT_OVERRIDE port.
+[[ "$(h3_ok h3.local 443)" == "3" ]] \
+    || { printf 'FAIL: h3.local did not serve HTTP/3 on 443 (got %s/3)\n' "$(h3_ok h3.local 443)"; exit 1; }
+[[ "$(h3_ok alt.local 4444)" == "3" ]] \
+    || { printf 'FAIL: alt.local did not serve HTTP/3 on its override port 4444\n'; exit 1; }
+
+# 2. A site not listed in HTTP3_SITES has no QUIC listener at all.
+[[ "$(h3_ok plain.local 443 2)" == "0" ]] \
+    || { printf 'FAIL: plain.local answered HTTP/3 but is not in HTTP3_SITES\n'; exit 1; }
+
+# 3. STRICT_SNI (default): unknown SNI is refused over HTTP/3 on every port,
+#    matching the TCP behaviour rather than leaking the first site.
+[[ "$(h3_ok zz.local 443 2)" == "0" ]] \
+    || { printf 'FAIL: unknown SNI was served over HTTP/3 on 443\n'; exit 1; }
+[[ "$(h3_ok zz.local 4444 2)" == "0" ]] \
+    || { printf 'FAIL: unknown SNI was served over HTTP/3 on 4444\n'; exit 1; }
+
+# 4. STRICT_SNI on the TCP side: a bare-IP request to an override port used to
+#    be served by whichever site sorted first. It must now be refused.
+bare_code="$(curl -ksS -m 5 -o /dev/null -w '%{http_code}' "https://127.0.0.1:$H3_ALT_PORT/" 2>/dev/null || true)"
+[[ "$bare_code" != "200" ]] \
+    || { printf 'FAIL: bare-IP request to an override port returned 200; STRICT_SNI did not take effect\n'; exit 1; }
+
+# 5. Alt-Svc is what makes a browser upgrade, and it must carry the site's real
+#    port. Absent entirely on a site without HTTP/3.
+alt_443="$(curl -ksSI -m 5 --resolve "h3.local:$H3_HTTPS_PORT:127.0.0.1" "https://h3.local:$H3_HTTPS_PORT/" 2>/dev/null | tr -d '\r' | grep -i '^alt-svc:' || true)"
+printf '%s' "$alt_443" | grep -q 'h3=":443"' \
+    || { printf 'FAIL: Alt-Svc missing or wrong on h3.local, got: %q\n' "$alt_443"; exit 1; }
+alt_4444="$(curl -ksSI -m 5 --resolve "alt.local:$H3_ALT_PORT:127.0.0.1" "https://alt.local:$H3_ALT_PORT/" 2>/dev/null | tr -d '\r' | grep -i '^alt-svc:' || true)"
+printf '%s' "$alt_4444" | grep -q 'h3=":4444"' \
+    || { printf 'FAIL: Alt-Svc on an override-port site must advertise :4444, got: %q\n' "$alt_4444"; exit 1; }
+alt_plain="$(curl -ksSI -m 5 --resolve "plain.local:$H3_HTTPS_PORT:127.0.0.1" "https://plain.local:$H3_HTTPS_PORT/" 2>/dev/null | tr -d '\r' | grep -ci '^alt-svc:' || true)"
+[[ "$alt_plain" == "0" ]] \
+    || { printf 'FAIL: a site without HTTP/3 must not advertise Alt-Svc\n'; exit 1; }
+
+# 6. HTTP/2 is untouched for a site that has no HTTP/3.
+plain_code="$(curl -ksS -m 5 -o /dev/null -w '%{http_code}' --resolve "plain.local:$H3_HTTPS_PORT:127.0.0.1" "https://plain.local:$H3_HTTPS_PORT/")"
+[[ "$plain_code" == "200" ]] \
+    || { printf 'FAIL: plain.local over HTTPS returned %s, expected 200\n' "$plain_code"; exit 1; }
+
+# 7. Exactly one `reuseport` per port. nginx refuses to start with two, and with
+#    none QUIC fails intermittently -- so pin the invariant rather than trusting
+#    that a passing run means it is right.
+"${H3_COMPOSE[@]}" exec -T proxy sh -c '
+dupes=$(grep -ho "listen [0-9]* quic reuseport" /etc/nginx/conf.d/*.conf | sort | uniq -c | awk "\$1 != 1")
+[ -z "$dupes" ] || { echo "FAIL: reuseport is not exactly once per port:"; echo "$dupes"; exit 1; }
+for p in 443 4444; do
+    n=$(grep -ho "listen $p quic reuseport" /etc/nginx/conf.d/*.conf | wc -l | tr -d " ")
+    [ "$n" = "1" ] || { echo "FAIL: port $p has $n reuseport listeners, expected exactly 1"; exit 1; }
+done' || exit 1
+
+# 8. The UDP listener is actually bound on each HTTP/3 port.
+"${H3_COMPOSE[@]}" exec -T proxy sh -c '
+for p in 443 4444; do
+    netstat -lun 2>/dev/null | grep -q ":$p " || { echo "FAIL: no UDP listener on port $p"; exit 1; }
+done' || exit 1
+
+"${H3_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+
 # --- HTTPS_PORT_OVERRIDE config generation (DRY_RUN) ---
 port_check() {
     docker run --rm \
@@ -762,6 +888,127 @@ conf=/etc/nginx/conf.d/nginx-auto-tls-proxy-p.local.conf
 awk "/^    location \^~ \/events \{/,/^    \}/" "$conf" | grep -q "proxy_pass http://backend:3000;" \
     || { echo "FAIL: resolver-less stream location should use a URI-less proxy_pass"; exit 1; }
 '
+
+
+# --- HTTP3_SITES / STRICT_SNI config generation & validation (DRY_RUN) ---
+# Positive: '*' enables every eligible site, skipping TLS-terminator silently,
+# and an alias-targeted entry lands on the owner block.
+docker run --rm \
+    -e STATIC_SITES="a.local" \
+    -e SITE_ALIASES="a.local:www.a.local" \
+    -e TLS_TERMINATOR_PROXY="s.local:4343:backend:8080" \
+    -e HTTP3_SITES="*" \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh >/dev/null 2>&1
+grep -q "listen 443 quic;" /etc/nginx/conf.d/nginx-auto-tls-proxy-a.local.conf \
+    || { echo "FAIL: * should enable HTTP/3 on a.local"; exit 1; }
+grep -q "http3 on;" /etc/nginx/conf.d/nginx-auto-tls-proxy-a.local.conf \
+    || { echo "FAIL: http3 directive missing"; exit 1; }
+grep -q "add_header Alt-Svc .h3=\":443\"" /etc/nginx/conf.d/nginx-auto-tls-proxy-a.local.conf \
+    || { echo "FAIL: Alt-Svc missing on an HTTP/3 site"; exit 1; }
+! grep -q "quic" /etc/nginx/conf.d/nginx-auto-tls-proxy-s.local.conf \
+    || { echo "FAIL: * must skip TLS-terminator sites"; exit 1; }
+grep -q "listen 443 quic reuseport default_server;" /etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf \
+    || { echo "FAIL: the catch-all should own reuseport for port 443"; exit 1; }
+'
+
+# An alias may be used to enable the owning site.
+docker run --rm \
+    -e STATIC_SITES="a.local" -e SITE_ALIASES="a.local:www.a.local" \
+    -e HTTP3_SITES="www.a.local" -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh >/dev/null 2>&1
+grep -q "listen 443 quic;" /etc/nginx/conf.d/nginx-auto-tls-proxy-a.local.conf \
+    || { echo "FAIL: alias-targeted HTTP3_SITES should enable the owner block"; exit 1; }
+'
+
+# Byte-shape guarantee: neither an unset nor an empty HTTP3_SITES emits any
+# HTTP/3 config. An empty value must behave exactly like the absent variable.
+h3_absent_check='
+/entrypoint.sh >/dev/null 2>&1
+! grep -rq "quic" /etc/nginx/conf.d/ || { echo "FAIL: quic emitted without HTTP3_SITES"; exit 1; }
+! grep -rq "http3" /etc/nginx/conf.d/ || { echo "FAIL: http3 emitted without HTTP3_SITES"; exit 1; }
+! grep -rq "Alt-Svc" /etc/nginx/conf.d/ || { echo "FAIL: Alt-Svc emitted without HTTP3_SITES"; exit 1; }
+'
+docker run --rm \
+    -e STATIC_SITES="a.local" -e PROXY_SITES="p.local:http://backend:3000/" \
+    -e DRY_RUN=1 --entrypoint bash "$PORT_IMG" -c "$h3_absent_check"
+docker run --rm \
+    -e STATIC_SITES="a.local" -e PROXY_SITES="p.local:http://backend:3000/" \
+    -e HTTP3_SITES="" -e DRY_RUN=1 --entrypoint bash "$PORT_IMG" -c "$h3_absent_check"
+
+# STRICT_SNI defaults to 1: every HTTPS port in use gets a rejecting catch-all.
+docker run --rm \
+    -e STATIC_SITES="a.local,b.local" -e HTTPS_PORT_OVERRIDE="b.local:4444" \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh >/dev/null 2>&1
+conf=/etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf
+grep -q "listen 443 ssl default_server;"  "$conf" || { echo "FAIL: no 443 catch-all"; exit 1; }
+grep -q "listen 4444 ssl default_server;" "$conf" || { echo "FAIL: STRICT_SNI should add a catch-all for override port 4444"; exit 1; }
+[ "$(grep -c "ssl_reject_handshake on;" "$conf")" = "2" ] || { echo "FAIL: expected two rejecting catch-alls"; exit 1; }
+'
+
+# STRICT_SNI=0 restores the pre-0.10.0 behaviour: no catch-all on override ports.
+docker run --rm \
+    -e STATIC_SITES="a.local,b.local" -e HTTPS_PORT_OVERRIDE="b.local:4444" \
+    -e STRICT_SNI=0 -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh >/dev/null 2>&1
+conf=/etc/nginx/conf.d/nginx-auto-tls-proxy-00-default.conf
+grep -q "listen 443 ssl default_server;" "$conf" || { echo "FAIL: 443 catch-all should still exist"; exit 1; }
+! grep -q "listen 4444 ssl default_server;" "$conf" || { echo "FAIL: STRICT_SNI=0 must not add an override-port catch-all"; exit 1; }
+'
+
+# STRICT_SNI=0 with HTTP/3 on an override port: reuseport moves onto the first
+# HTTP/3 site there, and the resulting asymmetry is warned about.
+docker run --rm \
+    -e STATIC_SITES="a.local,b.local" -e HTTPS_PORT_OVERRIDE="b.local:4444" \
+    -e HTTP3_SITES="b.local" -e STRICT_SNI=0 -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+out=$(/entrypoint.sh 2>&1)
+printf "%s" "$out" | grep -q "STRICT_SNI=0 and HTTP/3 on port 4444" \
+    || { echo "FAIL: expected a warning about the HTTP/2 vs HTTP/3 fall-through asymmetry"; exit 1; }
+grep -q "listen 4444 quic reuseport;" /etc/nginx/conf.d/nginx-auto-tls-proxy-b.local.conf \
+    || { echo "FAIL: with no catch-all, the first HTTP/3 site on the port must carry reuseport"; exit 1; }
+'
+
+# Negative: a host that is not a configured site or alias.
+docker run --rm \
+    -e STATIC_SITES="a.local" -e HTTP3_SITES="nope.local" -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected an unknown host"; exit 1; }
+true
+' | grep -q 'HTTP3_SITES host must be a configured site or alias' \
+    || { printf 'FAIL: should reject HTTP3_SITES for an unknown host\n'; exit 1; }
+
+# Negative: naming a TLS-terminator site explicitly is an error (unlike '*').
+docker run --rm \
+    -e TLS_TERMINATOR_PROXY="s.local:4343:backend:8080" -e HTTP3_SITES="s.local" -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected HTTP/3 on a TLS-terminator"; exit 1; }
+true
+' | grep -q 'cannot be used with TLS_TERMINATOR_PROXY' \
+    || { printf 'FAIL: should reject HTTP3_SITES on a TLS_TERMINATOR_PROXY site\n'; exit 1; }
+
+# Negative: '*' cannot be mixed with explicit entries.
+docker run --rm \
+    -e STATIC_SITES="a.local" -e HTTP3_SITES="*,a.local" -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected * combined with entries"; exit 1; }
+true
+' | grep -q "cannot be combined with other entries" \
+    || { printf 'FAIL: should reject HTTP3_SITES mixing * with explicit hosts\n'; exit 1; }
+
+# Negative: STRICT_SNI must be 0 or 1.
+docker run --rm \
+    -e STATIC_SITES="a.local" -e STRICT_SNI="yes" -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected STRICT_SNI=yes"; exit 1; }
+true
+' | grep -q 'STRICT_SNI must be 0 or 1' \
+    || { printf 'FAIL: should reject a non-boolean STRICT_SNI\n'; exit 1; }
 
 # --- Negative: plain image must reject STATIC_PHP_SITES with a clear error. ---
 NEG_COMPOSE_FILE="$TMP_DIR/docker-compose-php-negative.yaml"

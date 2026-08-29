@@ -2,6 +2,23 @@
 
 All notable changes to `nginx-auto-tls-proxy` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-08-29
+
+### Added
+
+- New `HTTP3_SITES` environment variable enabling **HTTP/3 (QUIC)** per site, alongside HTTP/2 rather than instead of it. Accepts a comma-separated host list, `*` for every eligible site, or an empty value which behaves exactly like the variable being absent. A host may be a primary or an alias and enables the owning server block.
+- Each enabled site gains `listen <port> quic;`, `http3 on;`, and an `Alt-Svc: h3=":<port>"; ma=86400` response header — the advertisement without which no browser will ever attempt HTTP/3. The advertised port follows the port the site is actually served on, including under `HTTPS_PORT_OVERRIDE`.
+- `*` skips `TLS_TERMINATOR_PROXY` sites silently, since they are layer 4 and have no HTTP layer; naming one explicitly is a startup error. Startup also rejects `*` combined with other entries, unknown hosts, and an nginx build without `--with-http_v3_module`.
+- The single `reuseport` listener each port is allowed is placed on the generated catch-all. This is a correctness requirement, not a performance tweak: without it nginx's workers share one UDP socket, QUIC packets reach workers that do not hold the connection, and handshakes fail intermittently rather than outright.
+- `tests/smoke.sh` gains a dedicated HTTP/3 stack asserting real behaviour — HTTP/3 actually negotiated on both port 443 and an override port, a site not listed refusing HTTP/3, `Alt-Svc` present with the correct port and absent where HTTP/3 is off, the UDP listener bound, and exactly one `reuseport` per port. HTTP/3 requests run inside the container because host curl builds frequently lack HTTP/3 support. `tests/smoke-php.sh` covers PHP executing over HTTP/3 on a `static-php` site.
+
+### Changed
+
+- **`STRICT_SNI`, new and defaulting to `1`, rejects connections whose SNI matches no configured site on every HTTPS port.** Port 443 has always done this. What changes is `HTTPS_PORT_OVERRIDE` ports, which previously had no catch-all at all: a request with an unknown hostname — or none, as when connecting to a bare IP address — was served by whichever site's config file sorted first, together with that site's certificate.
+- **This can break bare-IP access to a site on an override port.** `https://<ip>:4444/` now fails the TLS handshake where it previously returned a site. Set `STRICT_SNI=0` to restore the previous behaviour exactly; deployments without `HTTPS_PORT_OVERRIDE` are unaffected.
+- With `STRICT_SNI=0` and HTTP/3 both in use, an unknown hostname falls through to the first site over HTTP/2 but to the first HTTP/3-enabled site over HTTP/3, which may differ. Startup warns when this combination applies. The default has no such asymmetry.
+- Generated configuration is byte-for-byte identical to 0.9.0 for any deployment that neither sets `HTTP3_SITES` nor uses `HTTPS_PORT_OVERRIDE`; with an override port the only difference is the added catch-all block.
+
 ## [0.9.0] - 2026-08-29
 
 ### Added
