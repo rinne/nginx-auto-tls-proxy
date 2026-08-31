@@ -122,7 +122,7 @@ docker compose -f dc/try/docker-compose.yaml down -v
 | `PHP_MEMORY_LIMIT` | `128M` | PHP `memory_limit`; default `128M`. Format: integer + optional `K`/`M`/`G`, or `-1` for unlimited. |
 | `PHP_MAX_EXECUTION_TIME` | `30` | PHP `max_execution_time` in seconds; default `30`. `0` = unlimited. FPM `request_terminate_timeout` and nginx `fastcgi_read_timeout` derive from this. |
 | `HSTS_MAX_AGE` | `31536000` | Optional HSTS max-age. Disabled by default with `0`. |
-| `STATIC_FALLBACK_PAGES` | `1` | Optionally creates simple `404.html` and `50x.html` files for static sites when missing. |
+| `STATIC_FALLBACK_PAGES` | `1` | Creates simple `404.html` and `50x.html` files for static sites when missing. Disabled by default with `0`. |
 | `OCSP_STAPLING` | `1` | Optional OCSP stapling for real CA certificates. Disabled by default. |
 | `REAL_IP_FROM` | `172.16.0.0/12` | Optional comma-separated trusted proxy ranges for nginx real-ip handling. |
 | `REAL_IP_HEADER` | `X-Forwarded-For` | Header used with `REAL_IP_FROM`. |
@@ -324,7 +324,7 @@ Behavior and scope:
 - **HTTPS only.** The allow list is emitted on the HTTPS server block. Plain HTTP on port 80 stays open so ACME (`/.well-known/acme-challenge/`) and the HTTP→HTTPS redirect keep working even for a locked-down site.
 - **All site types except TLS-terminator.** Static, static-php, proxy, and redirect sites accept `SITE_ALLOWED_IPS`. TLS-terminator (L4 `stream`) sites have no HTTP layer to return a 403 and are rejected at startup.
 - **Aliases work.** A rule written against an alias applies to the owning primary's server block, so it covers the primary and every alias that shares it.
-- **Behind a trusted proxy.** nginx matches the connecting `$remote_addr`. If clients reach this container through an upstream load balancer, set [`REAL_IP_FROM`](#environment-variables) / `REAL_IP_HEADER` so the real client IP is matched instead of the proxy's.
+- **Behind a trusted proxy.** nginx matches the connecting `$remote_addr`. If clients reach this container through an upstream load balancer, set [`REAL_IP_FROM`](#configuration) / `REAL_IP_HEADER` so the real client IP is matched instead of the proxy's.
 
 ## Reverse Proxy Sites
 
@@ -471,7 +471,7 @@ buffering and the global timeout, which is why this is a per-path opt-in rather
 than a per-site switch — turning buffering off for a whole site would slow every
 normal response on it for the sake of one endpoint.
 
-### Scope and rules
+### Scope and interactions
 
 - **Proxy sites only.** Static, static-php, redirect and TLS-terminator sites are
   rejected at startup.

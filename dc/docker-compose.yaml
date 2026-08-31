@@ -3,30 +3,76 @@ services:
     image: nginx-auto-tls-proxy:local
     build:
       context: ../nginx-auto-tls-proxy
+      # Set WITH_PHP=1 to build the -php variant (needed for STATIC_PHP_SITES)
+      # args:
+      #   WITH_PHP: "1"
     ports:
       - "80:80"
       - "443:443"
+      # HTTP/3 runs over UDP. Required when HTTP3_SITES is set; harmless otherwise.
+      - "443:443/udp"
     volumes:
-      - ssl_certs:/ssl       # persist TLS certs (self-signed + LE)
+      - ssl_certs:/ssl       # persist TLS certs (self-signed + LE). Back this up.
       - site_data:/sites     # persist static site content
     environment:
+      # --- Site types -----------------------------------------------------
       # Comma-separated hostnames for static file serving
       STATIC_SITES: "example.local"
+      # PHP-enabled static sites. Requires the -php image variant.
+      STATIC_PHP_SITES: ""
       # Optional domain:absolute-path overrides for selected static site roots
       STATIC_SITE_ROOTS: ""
       # Comma-separated domain:upstream-url pairs for reverse proxy
       # Example: myapp.com:http://app:3000/,api.com:http://api:8080/
       PROXY_SITES: ""
+      # 302-redirect-only hostnames: source:destination[:deep|no-deep]
+      SITE_REDIRECTS: ""
+      # L4 TLS termination: host:listen_port:backend_host:backend_port[:proxy_protocol]
+      # Each entry needs its own listen port, and that port must be published above.
+      TLS_TERMINATOR_PROXY: ""
       # Aliases: domain.com:www.domain.com,olddomain.com,domain2.com:www.domain2.com
       SITE_ALIASES: ""
       # Optional existing primary site for unknown HTTP hostnames; HTTPS unknown SNI is still rejected
       DEFAULT_SITE: ""
+
+      # --- Routing and access control -------------------------------------
+      # Internal rewrites, newline-delimited: <host> <regex> <replacement> [last|break]
+      SITE_REWRITES: ""
+      # Per-site IP allow lists. SEMICOLON between sites, comma between IPs.
+      # Example: intranet.example.com:10.20.30.0/24,192.168.0.0/16;admin.example.com:127.0.0.1
+      SITE_ALLOWED_IPS: ""
       # Optional mounted htpasswd files: domain.com:/run/secrets/domain.htpasswd
       BASIC_AUTH_FILES: ""
-      # Reverse-proxy/body tuning
+      # Reject connections whose SNI matches no configured site, on every HTTPS
+      # port. "0" restores pre-0.10.0 behaviour on HTTPS_PORT_OVERRIDE ports.
+      STRICT_SNI: "1"
+
+      # --- Ports and protocols --------------------------------------------
+      # Serve specific hosts on a non-443 HTTPS port: host:port,...
+      # Publish each port above as well.
+      HTTPS_PORT_OVERRIDE: ""
+      # Hostnames served over HTTP/3 (QUIC) as well as HTTP/2. "*" enables all.
+      # Requires the 443:443/udp publication above.
+      HTTP3_SITES: ""
+
+      # --- Reverse-proxy tuning -------------------------------------------
       CLIENT_MAX_BODY_SIZE: "16m"
       PROXY_READ_TIMEOUT: "60s"
       PROXY_SEND_TIMEOUT: "60s"
+      # Long-lived streaming (SSE) endpoints: host:/path-prefix[:timeout]
+      PROXY_STREAM_PATHS: ""
+      # DNS for proxy upstreams. 127.0.0.11 is Docker's embedded resolver, and
+      # re-resolving at runtime means a restarted backend is picked up.
+      # "default" falls back to nginx startup-time resolution.
+      PROXY_RESOLVER: "127.0.0.11"
+      PROXY_RESOLVER_VALID: "5s"
+
+      # --- PHP (only meaningful on the -php image) ------------------------
+      PHP_FPM_PROFILE: "M"
+      PHP_MEMORY_LIMIT: "128M"
+      PHP_MAX_EXECUTION_TIME: "30"
+
+      # --- TLS and headers ------------------------------------------------
       # Enable only after confirming every hostname should be HTTPS-only
       HSTS_MAX_AGE: "0"
       # Optionally generate simple 404.html and 50x.html files for static sites
@@ -36,7 +82,10 @@ services:
       # Trusted proxy support, e.g. REAL_IP_FROM: "172.16.0.0/12"
       REAL_IP_FROM: ""
       REAL_IP_HEADER: "X-Forwarded-For"
-      # Set to enable Let's Encrypt certificate management
+
+      # --- Let's Encrypt --------------------------------------------------
+      # Set to enable Let's Encrypt certificate management. Every hostname must
+      # resolve publicly to this container on port 80 first.
       LETSENCRYPT_EMAIL: ""
       # Set to "1" to temporarily disable LE even when LETSENCRYPT_EMAIL is configured
       LETSENCRYPT_DISABLE: "0"
@@ -45,6 +94,7 @@ services:
       # Renewal loop interval and "renew before" threshold
       LETSENCRYPT_RENEW_INTERVAL_SECONDS: "43200"
       LE_RENEW_BEFORE_DAYS: "30"
+
       # Validate generated config and exit without starting nginx/certbot
       DRY_RUN: "0"
     restart: unless-stopped
