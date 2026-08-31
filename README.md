@@ -1004,6 +1004,194 @@ Advanced per-site snippets can be mounted under:
 
 Generated config files are named `/etc/nginx/conf.d/nginx-auto-tls-proxy-*.conf`, and `/etc/nginx/stream.d/nginx-auto-tls-proxy-*.conf` for `TLS_TERMINATOR_PROXY` sites; other mounted `.conf` files are not removed on startup.
 
+## Running In Production
+
+### Pre-flight checklist
+
+Before the first start with `LETSENCRYPT_EMAIL` set:
+
+- [ ] **Every primary hostname and alias resolves publicly to this container.**
+      Certificate issuance fails otherwise, and failures count against Let's
+      Encrypt rate limits.
+- [ ] **Port 80 is reachable from the internet.** HTTP-01 challenges arrive
+      there. It stays open even for sites behind `SITE_ALLOWED_IPS`, precisely
+      so renewal keeps working.
+- [ ] **`/ssl` is persisted** as a named volume or bind mount. Without it every
+      restart discards certificates and re-requests them.
+- [ ] **`/sites` is persisted** if you serve static content from the default root.
+- [ ] **Every port you configure is published**, including `443:443/udp` for
+      `HTTP3_SITES`, each `HTTPS_PORT_OVERRIDE` port, and each
+      `TLS_TERMINATOR_PROXY` listen port.
+- [ ] **`restart: unless-stopped`** is set.
+- [ ] **Dry-run first:** `DRY_RUN=1` prints the site plan and runs `nginx -t`
+      without starting anything or touching Let's Encrypt.
+
+Then read the startup log once. The site plan lists every site with its mode,
+aliases, target, certificate source and active features — the fastest way to
+catch a hostname that silently fell into the wrong mode.
+
+### What to back up
+
+**`/ssl`, and nothing else is nearly as important.** It holds the per-site
+certificates *and* certbot's own state under `/ssl/letsencrypt`. Losing it means
+every certificate is re-requested from scratch, which risks running into Let's
+Encrypt rate limits at exactly the moment your site is down.
+
+`/sites` matters if it is the source of truth for your content rather than a
+mount of something you already deploy elsewhere. Generated nginx configuration
+needs no backup — it is rebuilt from environment variables on every start.
+
+### Health and supervision
+
+The container healthcheck asserts three things: the nginx master process is
+alive, port 80 answers with an HTTP status line, and — only on `-php` images
+with FPM running — that php-fpm replies `pong` on its FastCGI `/ping` endpoint.
+
+If either supervised process exits, the entrypoint stops the other and the
+container exits, so `restart: unless-stopped` gives you a clean restart rather
+than a half-running container serving errors.
+
+### Reading the logs
+
+The access log carries the served hostname and the protocol, so one line tells
+you which site answered and over what:
+
+```
+1.2.3.4 - - [31/Aug/2026:10:50:40 +0000] admin.example.com "GET /app.js HTTP/3.0" 200 595 "..." "..." "-"
+                                         ^ $host                              ^ protocol
+```
+
+To see the protocol mix at a glance — the quickest check that HTTP/3 is really
+being used:
+
+```bash
+docker compose logs proxy | grep -oE 'HTTP/[0-9]\.[0-9]"' | sort | uniq -c
+```
+
+`TLS_TERMINATOR_PROXY` sites log separately to `/var/log/nginx/stream-access.log`,
+since layer-4 connections have no HTTP request line to record.
+
+### Certificate renewal
+
+With `LETSENCRYPT_EMAIL` set, a background loop runs `certbot renew` every
+`LETSENCRYPT_RENEW_INTERVAL_SECONDS` (default 12 hours). Certificates are
+renewed once they are within `LE_RENEW_BEFORE_DAYS` (default 30) of expiry. On
+success a deploy hook copies the result to `/ssl/<domain>/` and reloads nginx —
+no restart, no dropped connections.
+
+Nothing needs scheduling on the host.
+
+## Troubleshooting
+
+### HTTP/3 is advertised but never used
+
+Almost always the UDP port. `- "443:443"` in Compose publishes **TCP only**, and
+the failure is silent: browsers try once, get nothing, and stay on HTTP/2.
+
+```bash
+# Is UDP published? Note the flag -- "443/udp" as a positional argument is a
+# parse error, not a "no" answer.
+docker compose port --protocol udp proxy 443
+
+# Does HTTP/3 work from inside, bypassing publishing and any firewall?
+docker compose exec proxy curl --http3-only -sS -o /dev/null \
+  -w '%{http_version}\n' --resolve example.com:443:127.0.0.1 https://example.com/
+```
+
+If the inside test prints `3` but an outside test times out, the packets are
+being dropped between the internet and the container: either the port is not
+published, or a firewall is blocking inbound UDP 443. Cloud security groups
+routinely allow TCP 443 while leaving UDP closed, since nothing needed it before
+QUIC.
+
+Note that most system `curl` builds have no HTTP/3 support — check with
+`curl -V | grep HTTP3`. This image's own curl does, which is why the commands
+above run inside the container.
+
+### A site is still on a self-signed certificate
+
+Check, in order: `LETSENCRYPT_EMAIL` is set and `LETSENCRYPT_DISABLE` is not
+`1`; the hostname and all its aliases resolve publicly to this container; port
+80 reaches it from the internet. Certbot output goes to the container log, and
+its own logs persist under `/ssl/letsencrypt/logs`.
+
+Use `LETSENCRYPT_STAGING=1` while debugging. Staging certificates are not
+trusted by browsers, but the staging rate limits are far more forgiving.
+
+### A proxy site returns 502
+
+The upstream name is resolved at request time through `PROXY_RESOLVER`. A 502
+usually means the upstream container is down or its name does not resolve — with
+Compose, the service must share a network with the proxy. Confirm from inside:
+
+```bash
+docker compose exec proxy curl -sS -o /dev/null -w '%{http_code}\n' http://app:3000/
+```
+
+If you set `PROXY_RESOLVER=default`, nginx resolves once at startup instead, so
+a backend that changed address needs this container restarted.
+
+### Connection refused for a bare IP address or an unknown hostname
+
+That is `STRICT_SNI`, which defaults to `1` and rejects connections whose SNI
+matches no configured site. Use a configured hostname, or set `STRICT_SNI=0` to
+restore the older behaviour. See [Unknown Hostnames](#unknown-hostnames-strict_sni).
+
+### nginx refuses to start after adding `PROXY_STREAM_PATHS`
+
+A mounted snippet under `/etc/nginx/site-conf.d/<site>/` already defines the same
+location, and nginx rejects duplicates. The variable replaces that workaround —
+remove the snippet.
+
+### A site returns 403 to clients that should be allowed
+
+`SITE_ALLOWED_IPS` matches the connecting address. Behind a load balancer that
+is the balancer's address, not the client's — set `REAL_IP_FROM` to the trusted
+proxy range so the forwarded address is used instead.
+
+### A `.php` file downloads instead of executing
+
+The plain image tag is running. `STATIC_PHP_SITES` requires `:<version>-php`;
+the plain image refuses that variable at startup with an explicit message.
+
+## Upgrading
+
+Pull the new tag and recreate the container. Configuration is regenerated from
+environment variables at every start, `/ssl` carries the certificates forward,
+and nothing needs migrating.
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+Note that a `ports:` change needs `docker compose up -d` to recreate the
+container — `docker compose restart` will not pick it up.
+
+**0.9.x → 0.10.0** changed one default. `STRICT_SNI=1` extends unknown-SNI
+rejection to `HTTPS_PORT_OVERRIDE` ports, which previously served whichever site
+sorted first. If you reach such a port by bare IP address, that now fails; set
+`STRICT_SNI=0` to keep the old behaviour. Deployments without
+`HTTPS_PORT_OVERRIDE` are unaffected.
+
+## Versioning And Compatibility
+
+This project follows [Semantic Versioning](https://semver.org/). From 1.0.0
+onward, within the 1.x line:
+
+- **Environment variable grammar is stable.** Existing variables keep their
+  meaning and accepted syntax. New capabilities arrive as new variables, or as
+  optional fields appended to an existing one.
+- **Defaults do not change** in a way that alters observable behaviour. A change
+  like 0.10.0's `STRICT_SNI` would require a major version.
+- **Generated nginx configuration may change freely.** It is an implementation
+  detail; only the behaviour it produces is a contract.
+- **The `-php` variant tracks its PHP series.** A PHP major or minor bump is a
+  breaking change for that tag and will not happen silently within 1.x.
+
+Patch releases carry fixes and documentation. Minor releases add features and
+remain backwards compatible. Both image variants are always released together
+from one git revision.
+
 ## Build
 
 Local image (plain):
