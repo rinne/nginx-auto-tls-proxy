@@ -2,6 +2,27 @@
 
 All notable changes to `nginx-auto-tls-proxy` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-08-31
+
+First stable release. **The image itself is unchanged from 0.10.0** — no runtime
+file differs, so upgrading changes no behaviour. What 1.0.0 adds is a
+compatibility commitment, verified documentation, and wider test coverage.
+
+### Added
+
+- A stated compatibility contract for the 1.x line: environment variable grammar stays stable, defaults do not change in ways that alter observable behaviour, generated nginx configuration remains an implementation detail, and the `-php` variant will not change its PHP series silently. A change like 0.10.0's `STRICT_SNI` default would now require a major version.
+- Production documentation: a pre-flight checklist, what to back up and why (`/ssl` above all, since it holds certbot state as well as certificates), what the healthcheck actually asserts, how supervision and restart behave, how to read the access log including the protocol field, and how certificate renewal runs unattended.
+- A symptom-oriented troubleshooting section covering HTTP/3 advertised but never used, certificates staying self-signed, proxy 502s, connections refused for bare IP addresses, `nginx` refusing to start after adopting `PROXY_STREAM_PATHS`, unexpected 403s behind a load balancer, and `.php` files downloading instead of executing.
+- Upgrade notes, including the `STRICT_SNI` default change in 0.10.0 and the reminder that a `ports:` change needs `docker compose up -d` rather than `restart`.
+- Smoke coverage for variables that previously had none: `DEFAULT_SITE`, `HSTS_MAX_AGE`, `STATIC_FALLBACK_PAGES`, `OCSP_STAPLING`, `REAL_IP_FROM`, `REAL_IP_HEADER` and `PROXY_RESOLVER_VALID`. `REAL_IP_FROM` is asserted behaviourally: the same request is refused without a forwarded address and served with one inside an allowed range, proving real-ip and `SITE_ALLOWED_IPS` interact correctly.
+- A test exercising HTTP/3, a streaming path, basic auth and an IP allow list on a single site. Every feature was previously tested only in isolation.
+
+### Fixed
+
+- `dc/docker-compose.yaml`, the reference stack users copy, had drifted to roughly the 0.3.0 variable set — fourteen of the documented variables were missing, including every site type added since. It now lists all of them, grouped and commented, and publishes `443:443/udp` so HTTP/3 works when enabled.
+- A README link pointed at a heading that does not exist, and two sections shared the heading "Scope and rules", making that anchor ambiguous.
+- `STATIC_FALLBACK_PAGES` was the only boolean whose documented row did not state its default.
+
 ## [0.10.0] - 2026-08-29
 
 ### Added
