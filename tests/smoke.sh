@@ -51,6 +51,11 @@ services:
       SITE_REWRITES: |
         default.local ^/code/([A-Z]{4}-[A-Z]{4})\$ /landing.html
       SITE_ALLOWED_IPS: "allowed.local:10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,[2001:db8::/32];locked.local:10.255.255.0/24,[2001:db8::/32]"
+      DEFAULT_SITE: "default.local"
+      HSTS_MAX_AGE: "31536000"
+      STATIC_FALLBACK_PAGES: "1"
+      REAL_IP_FROM: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+      REAL_IP_HEADER: "X-Forwarded-For"
       LETSENCRYPT_EMAIL: ""
       CLIENT_MAX_BODY_SIZE: "16m"
       PROXY_READ_TIMEOUT: "60s"
@@ -213,6 +218,50 @@ assert_redirect 'HTTP locked.local (open for redirect)' \
     'https://locked.local/some/path' \
     -H 'Host: locked.local' "http://127.0.0.1:$HTTP_PORT/some/path"
 
+# --- DEFAULT_SITE / HSTS_MAX_AGE / STATIC_FALLBACK_PAGES / REAL_IP_FROM ---
+# An unknown HTTP hostname lands on DEFAULT_SITE rather than 404.
+assert_redirect 'HTTP unknown host (DEFAULT_SITE)' \
+    'https://default.local/some/path' \
+    -H 'Host: nosuch.local' "http://127.0.0.1:$HTTP_PORT/some/path"
+
+# Unknown HTTPS SNI is still rejected even with DEFAULT_SITE set -- the variable
+# is documented as HTTP-only.
+sni_code="$(curl -ksS -o /dev/null -w '%{http_code}' -m 5 \
+    --resolve "nosuch.local:$HTTPS_PORT:127.0.0.1" "https://nosuch.local:$HTTPS_PORT/" 2>/dev/null || true)"
+[[ "$sni_code" != "200" ]] \
+    || { printf 'FAIL: unknown HTTPS SNI was served; DEFAULT_SITE must not apply to HTTPS\n'; exit 1; }
+
+# HSTS is present on HTTPS and absent from the plain-HTTP redirect.
+# grep -c exits 1 on a zero count, which `set -e` would treat as fatal.
+hsts="$(curl -ksSI --resolve "default.local:$HTTPS_PORT:127.0.0.1" "https://default.local:$HTTPS_PORT/" 2>/dev/null | tr -d '\r' | grep -ci '^strict-transport-security: max-age=31536000' || true)"
+[[ "$hsts" == "1" ]] \
+    || { printf 'FAIL: HSTS_MAX_AGE did not emit a Strict-Transport-Security header\n'; exit 1; }
+hsts_http="$(curl -sSI -H 'Host: default.local' "http://127.0.0.1:$HTTP_PORT/" 2>/dev/null | tr -d '\r' | grep -ci '^strict-transport-security' || true)"
+[[ "$hsts_http" == "0" ]] \
+    || { printf 'FAIL: HSTS must not be sent over plain HTTP\n'; exit 1; }
+
+# STATIC_FALLBACK_PAGES generates the pages and nginx actually serves them.
+"${COMPOSE[@]}" exec -T proxy test -f /sites/default.local/404.html \
+    || { printf 'FAIL: STATIC_FALLBACK_PAGES did not create 404.html\n'; exit 1; }
+"${COMPOSE[@]}" exec -T proxy test -f /sites/default.local/50x.html \
+    || { printf 'FAIL: STATIC_FALLBACK_PAGES did not create 50x.html\n'; exit 1; }
+fb_code="$(curl -ksS -o /dev/null -w '%{http_code}' --resolve "default.local:$HTTPS_PORT:127.0.0.1" "https://default.local:$HTTPS_PORT/definitely-missing")"
+[[ "$fb_code" == "404" ]] \
+    || { printf 'FAIL: missing path returned %s, expected 404\n' "$fb_code"; exit 1; }
+
+# REAL_IP_FROM + REAL_IP_HEADER: with the test client inside a trusted range,
+# an X-Forwarded-For header replaces $remote_addr -- which SITE_ALLOWED_IPS then
+# matches against. locked.local allows only 10.255.255.0/24, so the same request
+# is 403 without the header and 200 with a forwarded address inside that range.
+xff_denied="$(curl -ksS -o /dev/null -w '%{http_code}' \
+    --resolve "locked.local:$HTTPS_PORT:127.0.0.1" "https://locked.local:$HTTPS_PORT/")"
+[[ "$xff_denied" == "403" ]] \
+    || { printf 'FAIL: locked.local without X-Forwarded-For returned %s, expected 403\n' "$xff_denied"; exit 1; }
+xff_allowed="$(curl -ksS -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 10.255.255.5' \
+    --resolve "locked.local:$HTTPS_PORT:127.0.0.1" "https://locked.local:$HTTPS_PORT/")"
+[[ "$xff_allowed" == "200" ]] \
+    || { printf 'FAIL: locked.local with a trusted X-Forwarded-For returned %s, expected 200 (REAL_IP_FROM not applied)\n' "$xff_allowed"; exit 1; }
+
 # Capture the built image ID before tearing down (compose state is lost after down).
 PORT_IMG="$("${COMPOSE[@]}" images -q proxy 2>/dev/null | head -1)"
 
@@ -286,6 +335,11 @@ services:
       PROXY_SITES: "sse.local:http://sse-backend:8080/,authsse.local:http://sse-backend:8080/"
       BASIC_AUTH_FILES: "authsse.local:/auth/htpasswd"
       PROXY_STREAM_PATHS: "sse.local:/events:30s,authsse.local:/events:30s"
+      # Interaction coverage: the same site carries HTTP/3, a streaming path,
+      # basic auth and an IP allow list simultaneously. 127.0.0.1 is listed for
+      # the in-container HTTP/3 probe, the RFC1918 ranges for the host probes.
+      HTTP3_SITES: "authsse.local"
+      SITE_ALLOWED_IPS: "authsse.local:127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
       PROXY_READ_TIMEOUT: "2s"
       PROXY_SEND_TIMEOUT: "60s"
       LETSENCRYPT_EMAIL: ""
@@ -403,6 +457,23 @@ b=$(awk "/^    location \^~ \/events \{/,/^    \}/" "$conf" | grep proxy_set_hea
 [ -n "$a" ] || { echo "FAIL: could not read location / headers"; exit 1; }
 [ "$a" = "$b" ] || { echo "FAIL: proxy_set_header sets have drifted apart"; printf "%s\n---\n%s\n" "$a" "$b"; exit 1; }
 ' || exit 1
+
+# 9. Feature interaction: HTTP/3 + streaming + basic auth + IP allow list on one
+#    site. Everything else in this suite tests these in isolation; this asserts
+#    they compose. An unbuffered SSE event must arrive over HTTP/3, through a
+#    location carrying auth_basic, on a server block with an allow list.
+h3_stream="$("${STREAM_COMPOSE[@]}" exec -T proxy sh -c \
+    'curl -ksS --http3-only -N -m 3 -u streamuser:streampass \
+     --resolve authsse.local:443:127.0.0.1 https://authsse.local/events 2>/dev/null' || true)"
+printf '%s\n' "$h3_stream" | grep -q 'data: one' \
+    || { printf 'FAIL: SSE did not stream over HTTP/3 with basic auth and an allow list; got: %q\n' "$h3_stream"; exit 1; }
+
+#    ...and the same request without credentials is still refused over HTTP/3.
+h3_401="$("${STREAM_COMPOSE[@]}" exec -T proxy sh -c \
+    'curl -ksS --http3-only -o /dev/null -w "%{http_code}" -m 5 \
+     --resolve authsse.local:443:127.0.0.1 https://authsse.local/events 2>/dev/null' || true)"
+[[ "$h3_401" == "401" ]] \
+    || { printf 'FAIL: unauthenticated HTTP/3 stream request returned %q, expected 401\n' "$h3_401"; exit 1; }
 
 "${STREAM_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 
@@ -1009,6 +1080,78 @@ docker run --rm \
 true
 ' | grep -q 'STRICT_SNI must be 0 or 1' \
     || { printf 'FAIL: should reject a non-boolean STRICT_SNI\n'; exit 1; }
+
+# --- OCSP_STAPLING / DEFAULT_SITE / REAL_IP_FROM config generation (DRY_RUN) ---
+# OCSP stapling needs a real CA to exercise end to end, so pin the directives.
+docker run --rm \
+    -e STATIC_SITES="a.local" -e OCSP_STAPLING=1 -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh >/dev/null 2>&1
+conf=/etc/nginx/conf.d/nginx-auto-tls-proxy-a.local.conf
+grep -q "ssl_stapling on;" "$conf"        || { echo "FAIL: no ssl_stapling"; exit 1; }
+grep -q "ssl_stapling_verify on;" "$conf" || { echo "FAIL: no ssl_stapling_verify"; exit 1; }
+grep -q "ssl_trusted_certificate /ssl/a.local/chain.crt;" "$conf" || { echo "FAIL: no trusted chain"; exit 1; }
+grep -q "resolver 1.1.1.1" "$conf"        || { echo "FAIL: stapling needs a resolver"; exit 1; }
+'
+# Off by default: no stapling directives unless asked for.
+docker run --rm \
+    -e STATIC_SITES="a.local" -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh >/dev/null 2>&1
+! grep -rq "ssl_stapling" /etc/nginx/conf.d/ || { echo "FAIL: OCSP stapling must be off by default"; exit 1; }
+'
+
+# Negative: DEFAULT_SITE must name a configured primary site.
+docker run --rm \
+    -e STATIC_SITES="a.local" -e DEFAULT_SITE="nope.local" -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected an unknown DEFAULT_SITE"; exit 1; }
+true
+' | grep -q 'DEFAULT_SITE must match a configured primary site' \
+    || { printf 'FAIL: should reject an unknown DEFAULT_SITE\n'; exit 1; }
+
+# Negative: DEFAULT_SITE cannot be a TLS-terminator (no HTTP layer to fall back to).
+docker run --rm \
+    -e TLS_TERMINATOR_PROXY="s.local:4343:backend:8080" -e DEFAULT_SITE="s.local" -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected a TLS-terminator DEFAULT_SITE"; exit 1; }
+true
+' | grep -q 'DEFAULT_SITE cannot be a TLS_TERMINATOR_PROXY site' \
+    || { printf 'FAIL: should reject a TLS-terminator DEFAULT_SITE\n'; exit 1; }
+
+# PROXY_RESOLVER_VALID reaches the generated resolver directive, and
+# PROXY_RESOLVER=default omits the resolver entirely.
+docker run --rm \
+    -e PROXY_SITES="p.local:http://backend:3000/" -e PROXY_RESOLVER_VALID="30s" -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh >/dev/null 2>&1
+grep -q "resolver 127.0.0.11 valid=30s;" /etc/nginx/conf.d/nginx-auto-tls-proxy-p.local.conf \
+    || { echo "FAIL: PROXY_RESOLVER_VALID did not reach the resolver directive"; exit 1; }
+'
+docker run --rm \
+    -e PROXY_SITES="p.local:http://backend:3000/" -e PROXY_RESOLVER="default" -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh >/dev/null 2>&1
+! grep -q "resolver " /etc/nginx/conf.d/nginx-auto-tls-proxy-p.local.conf \
+    || { echo "FAIL: PROXY_RESOLVER=default must emit no resolver directive"; exit 1; }
+'
+# Negative: PROXY_RESOLVER_VALID must look like a duration.
+docker run --rm \
+    -e PROXY_SITES="p.local:http://backend:3000/" -e PROXY_RESOLVER_VALID="soon" -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected a bad PROXY_RESOLVER_VALID"; exit 1; }
+true
+' | grep -q 'PROXY_RESOLVER_VALID must look like' \
+    || { printf 'FAIL: should reject a malformed PROXY_RESOLVER_VALID\n'; exit 1; }
+
+# Negative: REAL_IP_FROM rejects values that would be unsafe to interpolate.
+docker run --rm \
+    -e STATIC_SITES="a.local" -e REAL_IP_FROM='1.2.3.4; bad "' -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected an unsafe REAL_IP_FROM"; exit 1; }
+true
+' | grep -q 'Unsafe REAL_IP_FROM value' \
+    || { printf 'FAIL: should reject an unsafe REAL_IP_FROM value\n'; exit 1; }
 
 # --- Negative: plain image must reject STATIC_PHP_SITES with a clear error. ---
 NEG_COMPOSE_FILE="$TMP_DIR/docker-compose-php-negative.yaml"
