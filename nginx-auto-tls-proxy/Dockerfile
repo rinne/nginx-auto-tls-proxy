@@ -9,6 +9,12 @@ ARG IMAGE_REVISION=""
 ARG IMAGE_VERSION=""
 ARG WITH_PHP=0
 ARG PHP_TRACK=85
+# Lowest PHP version the -php image may ship. apk refuses to install anything
+# older, so a stale or lagging base image fails the build instead of silently
+# producing an image with a known-vulnerable PHP. Raise it on every PHP
+# security release (each raise is a patch release of this image); never lower
+# it. When overriding PHP_TRACK, pass a PHP_MIN_VERSION from that series too.
+ARG PHP_MIN_VERSION=8.5.12
 
 LABEL org.opencontainers.image.title="${IMAGE_TITLE}" \
       org.opencontainers.image.description="${IMAGE_DESCRIPTION}" \
@@ -26,8 +32,8 @@ RUN set -e ; \
     if [ "$WITH_PHP" = "1" ]; then \
         apk add --no-cache \
             fcgi \
-            "php${PHP_TRACK}" \
-            "php${PHP_TRACK}-fpm" \
+            "php${PHP_TRACK}>=${PHP_MIN_VERSION}" \
+            "php${PHP_TRACK}-fpm>=${PHP_MIN_VERSION}" \
             "php${PHP_TRACK}-mbstring" \
             "php${PHP_TRACK}-intl" \
             "php${PHP_TRACK}-curl" \

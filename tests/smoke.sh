@@ -336,8 +336,10 @@ services:
       BASIC_AUTH_FILES: "authsse.local:/auth/htpasswd"
       PROXY_STREAM_PATHS: "sse.local:/events:30s,authsse.local:/events:30s"
       # Interaction coverage: the same site carries HTTP/3, a streaming path,
-      # basic auth and an IP allow list simultaneously. 127.0.0.1 is listed for
-      # the in-container HTTP/3 probe, the RFC1918 ranges for the host probes.
+      # basic auth and an IP allow list simultaneously. 127.0.0.1 admits
+      # in-container probes; the RFC1918 ranges admit the host probes (NATed
+      # through the docker gateway) and the h3client sidecar on the compose
+      # network.
       HTTP3_SITES: "authsse.local"
       SITE_ALLOWED_IPS: "authsse.local:127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
       PROXY_READ_TIMEOUT: "2s"
@@ -348,6 +350,9 @@ services:
     volumes:
       - "$TMP_DIR/sse:/srv:ro"
     command: ["python3", "/srv/sse-server.py"]
+  h3client:
+    build:
+      context: "$ROOT_DIR/tests/h3client"
 EOF
 
 # Its own compose project name: the streaming stack shares TMP_DIR with the main
@@ -462,16 +467,18 @@ b=$(awk "/^    location \^~ \/events \{/,/^    \}/" "$conf" | grep proxy_set_hea
 #    site. Everything else in this suite tests these in isolation; this asserts
 #    they compose. An unbuffered SSE event must arrive over HTTP/3, through a
 #    location carrying auth_basic, on a server block with an allow list.
-h3_stream="$("${STREAM_COMPOSE[@]}" exec -T proxy sh -c \
+"${STREAM_COMPOSE[@]}" exec -T h3client curl -V | grep -q 'HTTP3' \
+    || { printf 'FAIL: h3client curl has no HTTP3 support; the h3 assertions would be meaningless\n'; exit 1; }
+h3_stream="$("${STREAM_COMPOSE[@]}" exec -T h3client sh -c \
     'curl -ksS --http3-only -N -m 3 -u streamuser:streampass \
-     --resolve authsse.local:443:127.0.0.1 https://authsse.local/events 2>/dev/null' || true)"
+     --connect-to authsse.local:443:proxy:443 https://authsse.local/events 2>/dev/null' || true)"
 printf '%s\n' "$h3_stream" | grep -q 'data: one' \
     || { printf 'FAIL: SSE did not stream over HTTP/3 with basic auth and an allow list; got: %q\n' "$h3_stream"; exit 1; }
 
 #    ...and the same request without credentials is still refused over HTTP/3.
-h3_401="$("${STREAM_COMPOSE[@]}" exec -T proxy sh -c \
+h3_401="$("${STREAM_COMPOSE[@]}" exec -T h3client sh -c \
     'curl -ksS --http3-only -o /dev/null -w "%{http_code}" -m 5 \
-     --resolve authsse.local:443:127.0.0.1 https://authsse.local/events 2>/dev/null' || true)"
+     --connect-to authsse.local:443:proxy:443 https://authsse.local/events 2>/dev/null' || true)"
 [[ "$h3_401" == "401" ]] \
     || { printf 'FAIL: unauthenticated HTTP/3 stream request returned %q, expected 401\n' "$h3_401"; exit 1; }
 
@@ -479,10 +486,11 @@ h3_401="$("${STREAM_COMPOSE[@]}" exec -T proxy sh -c \
 
 
 # --- HTTP3_SITES + STRICT_SNI: live HTTP/3 (own compose substack) ---
-# HTTP/3 assertions must run from INSIDE the container: the image's curl is
-# built with HTTP3, but the host's curl frequently is not (macOS, most Linux
-# distro builds). Running in-container also means the test needs no published
-# UDP port.
+# HTTP/3 assertions run from the h3client sidecar (tests/h3client, a Debian
+# curl built with HTTP3). The image's own curl cannot be used: Alpine's curl is
+# built without HTTP/3 as of 8.21, and the host's curl frequently lacks it too
+# (macOS, most Linux distro builds). Probing over the compose network also
+# means the test needs no published UDP port.
 H3_HTTPS_PORT="${H3_HTTPS_PORT:-18445}"
 H3_ALT_PORT="${H3_ALT_PORT:-18446}"
 H3_COMPOSE_FILE="$TMP_DIR/docker-compose-h3.yaml"
@@ -502,6 +510,9 @@ services:
       HTTPS_PORT_OVERRIDE: "alt.local:4444"
       HTTP3_SITES: "h3.local,alt.local"
       LETSENCRYPT_EMAIL: ""
+  h3client:
+    build:
+      context: "$ROOT_DIR/tests/h3client"
 EOF
 
 H3_PROJECT="$(basename "$TMP_DIR" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')h3"
@@ -521,21 +532,21 @@ for _ in $(seq 1 30); do
 done
 "${H3_COMPOSE[@]}" exec -T proxy /usr/local/bin/healthcheck.sh
 
-# The image's curl must actually support HTTP/3, or every assertion below would
-# "pass" as a false negative.
-"${H3_COMPOSE[@]}" exec -T proxy curl -V | grep -q 'HTTP3' \
-    || { printf 'FAIL: the image curl has no HTTP3 support; the h3 assertions would be meaningless\n'; exit 1; }
+# The sidecar's curl must actually support HTTP/3, or every assertion below
+# would "pass" as a false negative.
+"${H3_COMPOSE[@]}" exec -T h3client curl -V | grep -q 'HTTP3' \
+    || { printf 'FAIL: h3client curl has no HTTP3 support; the h3 assertions would be meaningless\n'; exit 1; }
 
 # How many of N forced-h3 attempts succeed. Repeated rather than single-shot:
 # QUIC without `reuseport` fails intermittently rather than outright, and a
 # one-attempt test would mostly pass while the config was broken.
 h3_ok() {
     local host="$1" port="$2" tries="${3:-3}"
-    "${H3_COMPOSE[@]}" exec -T proxy sh -c "
+    "${H3_COMPOSE[@]}" exec -T h3client sh -c "
         ok=0
         for i in \$(seq 1 $tries); do
             c=\$(curl -ksS --http3-only -m 6 -o /dev/null -w '%{http_code}' \
-                 --resolve $host:$port:127.0.0.1 https://$host:$port/ 2>/dev/null)
+                 --connect-to $host:$port:proxy:$port https://$host:$port/ 2>/dev/null)
             [ \"\$c\" = 200 ] && ok=\$((ok+1))
         done
         printf '%s' \"\$ok\"" 2>/dev/null | tr -d '\r'

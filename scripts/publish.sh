@@ -158,6 +158,12 @@ if [[ "$RETAG_LATEST_ONLY" -ne 1 ]]; then
 fi
 
 if [[ "${SKIP_SMOKE:-0}" != "1" ]]; then
+    # The smoke tests build through the default docker builder, which prefers
+    # a locally cached base image that may be months old. Refresh it so the
+    # tested image starts from the same current nginx:alpine as the pushed
+    # ones (the buildx invocations below pass --pull for the same reason).
+    echo "==> pulling base image nginx:alpine"
+    docker pull nginx:alpine
     echo "==> running smoke tests (plain + php)"
     tests/smoke.sh
     tests/smoke-php.sh
@@ -178,6 +184,7 @@ if [[ "$RETAG_LATEST_ONLY" -ne 1 ]]; then
     # and moving tags are not touched.
     echo "==> [1/2] building and pushing ${IMAGE}:${VERSION}-php for $PLATFORMS"
     docker buildx build \
+        --pull \
         --platform "$PLATFORMS" \
         --build-arg "WITH_PHP=1" \
         --build-arg "IMAGE_VERSION=${VERSION}" \
@@ -189,6 +196,7 @@ if [[ "$RETAG_LATEST_ONLY" -ne 1 ]]; then
 
     echo "==> [2/2] building and pushing ${IMAGE}:${VERSION} for $PLATFORMS"
     docker buildx build \
+        --pull \
         --platform "$PLATFORMS" \
         --build-arg "WITH_PHP=0" \
         --build-arg "IMAGE_VERSION=${VERSION}" \

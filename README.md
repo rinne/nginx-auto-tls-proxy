@@ -690,7 +690,8 @@ HTTP/3 for the next day. The advertised port always matches the port the site is
 actually served on, including under `HTTPS_PORT_OVERRIDE`.
 
 To confirm it works, use a client that supports HTTP/3 — note that many system
-curl builds do not, so check `curl -V | grep HTTP3` first:
+curl builds do not, and neither does the curl inside this image (Alpine builds
+its curl package without HTTP/3), so check `curl -V | grep HTTP3` first:
 
 ```bash
 curl -I --http3-only https://example.com/
@@ -797,6 +798,8 @@ A site in `STATIC_PHP_SITES` is identical to a `STATIC_SITES` entry in every oth
 This image ships **PHP 8.5.x** from the Alpine `php85` track. Use it to match `composer.json` `php` constraints and plugin compatibility against `>=8.5`.
 
 Operators who need a different track can rebuild from source with `--build-arg PHP_TRACK=84`. We may bump the default track in a future minor release; that is always a changelog-worthy event.
+
+The build also enforces a **minimum PHP version**. `ARG PHP_MIN_VERSION` (currently `8.5.12`) is applied as an apk version constraint on `php85` and `php85-fpm`, so a base image whose package repositories still carry an older PHP fails the build instead of producing an image with a known-vulnerable interpreter. The floor is raised with every PHP security release, each raise ships as a patch release of this image, and it is never lowered. When overriding `PHP_TRACK`, pass a floor from that series as well, for example `--build-arg PHP_TRACK=84 --build-arg PHP_MIN_VERSION=8.4.27`.
 
 ### Curated extension set
 
@@ -1093,9 +1096,13 @@ the failure is silent: browsers try once, get nothing, and stay on HTTP/2.
 # parse error, not a "no" answer.
 docker compose port --protocol udp proxy 443
 
-# Does HTTP/3 work from inside, bypassing publishing and any firewall?
-docker compose exec proxy curl --http3-only -sS -o /dev/null \
-  -w '%{http_version}\n' --resolve example.com:443:127.0.0.1 https://example.com/
+# Does HTTP/3 work from inside, bypassing publishing and any firewall? The
+# image's own curl has no HTTP/3, so borrow Debian's in a throwaway container
+# that shares the proxy's network namespace (127.0.0.1 is then nginx itself).
+docker run --rm --network "container:$(docker compose ps -q proxy)" debian:trixie-slim \
+  sh -c 'apt-get update -qq >/dev/null && apt-get install -y -qq curl >/dev/null \
+         && curl --http3-only -ksS -o /dev/null -w "%{http_version}\n" \
+              --resolve example.com:443:127.0.0.1 https://example.com/'
 ```
 
 If the inside test prints `3` but an outside test times out, the packets are
@@ -1104,9 +1111,10 @@ published, or a firewall is blocking inbound UDP 443. Cloud security groups
 routinely allow TCP 443 while leaving UDP closed, since nothing needed it before
 QUIC.
 
-Note that most system `curl` builds have no HTTP/3 support — check with
-`curl -V | grep HTTP3`. This image's own curl does, which is why the commands
-above run inside the container.
+Most system `curl` builds have no HTTP/3 support, and neither does the curl
+inside this image: Alpine builds its curl package without it as of curl 8.21.
+Check any client with `curl -V | grep HTTP3`. Debian's curl has it, which is
+why the inside test above borrows one rather than using `docker compose exec`.
 
 ### A site is still on a self-signed certificate
 
@@ -1167,6 +1175,13 @@ docker compose pull && docker compose up -d
 Note that a `ports:` change needs `docker compose up -d` to recreate the
 container — `docker compose restart` will not pick it up.
 
+**1.0.0 → 1.0.1** is a security update for the `-php` tag: PHP moves from
+8.5.9 to 8.5.12, fixing CVE-2026-109618 and CVE-2026-109619, two
+unauthenticated remote code execution flaws reported as exploited in the wild.
+Pull and recreate as above; recreating restarts php-fpm, which the fix
+requires. The plain tag only picks up the current nginx and Alpine base. No
+configuration changes.
+
 **0.9.x → 0.10.0** changed one default. `STRICT_SNI=1` extends unknown-SNI
 rejection to `HTTPS_PORT_OVERRIDE` ports, which previously served whichever site
 sorted first. If you reach such a port by bare IP address, that now fails; set
@@ -1197,14 +1212,16 @@ from one git revision.
 Local image (plain):
 
 ```bash
-docker build -t nginx-auto-tls-proxy:local nginx-auto-tls-proxy
+docker build --pull -t nginx-auto-tls-proxy:local nginx-auto-tls-proxy
 ```
 
 Local `:-php` image:
 
 ```bash
-docker build --build-arg WITH_PHP=1 -t nginx-auto-tls-proxy:local-php nginx-auto-tls-proxy
+docker build --pull --build-arg WITH_PHP=1 -t nginx-auto-tls-proxy:local-php nginx-auto-tls-proxy
 ```
+
+`--pull` makes Docker resolve `nginx:alpine` from the registry instead of a locally cached copy, which can be months old. A stale base does not produce a stale `-php` image silently: the build fails on the `PHP_MIN_VERSION` floor described under [Bundled PHP version](#bundled-php-version), which is the intended outcome.
 
 Dry-run generated config:
 
@@ -1226,6 +1243,8 @@ tests/smoke-php.sh
 
 `scripts/publish.sh` runs both before publishing.
 
+The HTTP/3 assertions run from a small Debian-based curl sidecar built from `tests/h3client/` and reach the proxy over the compose network, so no UDP port needs publishing. Alpine's curl package, and therefore the one inside the image under test, is built without HTTP/3 as of curl 8.21, and host curl builds rarely have it either.
+
 ## Publish To Docker Hub
 
 Releases are cut by hand with `scripts/publish.sh`. The script runs both smoke tests, then builds two multi-arch images (`linux/amd64`, `linux/arm64`) — one with `WITH_PHP=1`, one without — and publishes four tags from one git revision:
@@ -1244,12 +1263,14 @@ scripts/publish.sh 0.1.0
 
 The script is **ordered, not truly atomic**, by design. `docker buildx build --push` couples build and push for multi-arch manifests, so the two variants ship sequentially:
 
-1. Smoke tests (plain + `-php`).
+1. Pull the current `nginx:alpine`, then smoke tests (plain + `-php`).
 2. Pre-flight: registry check that neither `:<version>` nor `:<version>-php` already exists upstream.
 3. Build & push `:<version>-php` (riskier — extra packages, more failure surface).
 4. Build & push `:<version>` (plain).
 5. Promote moving tags `:latest` and `:latest-php` via `buildx imagetools create` (manifest-only, no rebuild).
 6. `git tag v<version>` and push.
+
+Both builds pass `--pull`, so the published images always start from the registry's current `nginx:alpine`, never a cached copy.
 
 The moving tags only flip when **both** versioned tags successfully pushed. If a build fails partway, the script's `--help` documents the recovery paths.
 
@@ -1264,6 +1285,8 @@ Useful environment overrides:
 - `IMAGE` — Docker Hub image name (default `timorinne/nginx-auto-tls-proxy`).
 - `PLATFORMS` — buildx target platforms (default `linux/amd64,linux/arm64`).
 
+When PHP publishes a security release, raise `PHP_MIN_VERSION` in the Dockerfile to the fixed version, record the CVEs in the changelog, and cut a patch release. The floor makes the `-php` build fail loudly if the base image's repositories have not caught up yet, so a release can never ship below it.
+
 The CI workflow at `.github/workflows/ci.yml` only runs the smoke tests on pushes and pull requests; it does not publish to Docker Hub.
 
 ## Repository Layout
@@ -1277,6 +1300,7 @@ nginx-auto-tls-proxy/php/  baked php.ini and FPM master config (only used when W
 scripts/publish.sh         manual Docker Hub release helper
 tests/smoke.sh             end-to-end Docker smoke test (plain image)
 tests/smoke-php.sh         end-to-end Docker smoke test (-php image)
+tests/h3client/            Debian curl sidecar with HTTP/3 for the smoke tests' QUIC probes
 CHANGELOG.md               release notes
 ROADMAP.md                 (local-only) design and maintenance notes
 ```

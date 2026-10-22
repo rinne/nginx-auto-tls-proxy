@@ -2,6 +2,29 @@
 
 All notable changes to `nginx-auto-tls-proxy` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-10-22
+
+Security release for the `-php` tag. Pull and recreate the container; there is
+nothing to configure.
+
+### Security
+
+- The `-php` image ships **PHP 8.5.12**, fixing CVE-2026-109618 and CVE-2026-109619 ("php2shell"): two unauthenticated remote code execution flaws in PHP's request handling, rated CVSS 9.2 by the PHP security team and reported as exploited in the wild. 1.0.0-php carried PHP 8.5.9. Every PHP SAPI is affected, including php-fpm, so this image's nginx-side hardening does not mitigate them and updating is the only fix. Recreating the container restarts php-fpm, which the fix requires.
+
+### Added
+
+- `ARG PHP_MIN_VERSION` (default `8.5.12`) in the Dockerfile. `php85` and `php85-fpm` are now installed with an apk `>=` constraint, so a build against a base image whose repositories still carry an older PHP fails instead of silently producing a vulnerable image. Alpine's stable branches picked up the fixed package within a day of PHP's release, but not simultaneously: for some hours Alpine 3.23 still served php85 8.5.6 while 3.24 already had 8.5.12, so a build from a cached `nginx:alpine` on the older branch would have produced a vulnerable image without any warning. The floor is raised with every PHP security release and never lowered; operators overriding `PHP_TRACK` pass a matching `PHP_MIN_VERSION`.
+
+### Changed
+
+- `scripts/publish.sh` pulls `nginx:alpine` before running the smoke tests and passes `--pull` to both buildx invocations, so the tested and the published images always start from the registry's current base rather than a cached one. The README's local build commands gain `--pull` for the same reason.
+- Both images are built from the current `nginx:alpine` (Alpine 3.24 with nginx 1.31.8 at release time; 1.0.0 was Alpine 3.24.1 with nginx 1.31.4). No behaviour or configuration changes.
+
+### Fixed
+
+- The smoke tests' HTTP/3 assertions ran the image's own curl, and Alpine's curl package (8.21 by August 2026) is built without HTTP/3. Both suites kept passing only because release builds tested against a months-old cached `nginx:alpine`; against a current base they fail at the first HTTP/3 probe. The probes now run from a Debian-based curl sidecar built from `tests/h3client/` and reach the proxy over the compose network, so the suites exercise the base that actually gets published.
+- The README's HTTP/3 troubleshooting advice ran the inside test with the image's curl and stated that it supports HTTP/3. It now borrows a Debian curl in a throwaway container sharing the proxy's network namespace, and the HTTP/3 section says the image's curl cannot be used as a client.
+
 ## [1.0.0] - 2026-08-31
 
 First stable release. **The image itself is unchanged from 0.10.0** — no runtime
