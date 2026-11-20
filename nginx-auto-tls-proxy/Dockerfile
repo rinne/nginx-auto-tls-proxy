@@ -7,6 +7,13 @@ ARG IMAGE_LICENSES="MIT"
 ARG IMAGE_SOURCE=""
 ARG IMAGE_REVISION=""
 ARG IMAGE_VERSION=""
+# Lowest nginx version the image may ship. nginx comes from the base image, not
+# from apk, so it is checked against the binary itself: a stale or lagging base
+# fails the build instead of silently producing an image with a known-vulnerable
+# nginx. Raise it on every nginx security release (each raise is a patch release
+# of this image); never lower it. When overriding NGINX_IMAGE with another
+# branch, such as nginx:stable-alpine, pass a NGINX_MIN_VERSION from that branch.
+ARG NGINX_MIN_VERSION=1.31.9
 ARG WITH_PHP=0
 ARG PHP_TRACK=85
 # Lowest PHP version the -php image may ship. apk refuses to install anything
@@ -22,6 +29,17 @@ LABEL org.opencontainers.image.title="${IMAGE_TITLE}" \
       org.opencontainers.image.source="${IMAGE_SOURCE}" \
       org.opencontainers.image.revision="${IMAGE_REVISION}" \
       org.opencontainers.image.version="${IMAGE_VERSION}"
+
+RUN set -e ; \
+    have="$(nginx -v 2>&1 | sed -n 's|^nginx version: nginx/||p')" ; \
+    if [ -z "$have" ]; then \
+        echo "cannot determine the base image's nginx version" >&2 ; exit 1 ; \
+    fi ; \
+    if [ "$(apk version -t "$have" "$NGINX_MIN_VERSION")" = "<" ]; then \
+        echo "base image ships nginx $have, below NGINX_MIN_VERSION $NGINX_MIN_VERSION; pull a current base (docker build --pull)" >&2 ; \
+        exit 1 ; \
+    fi ; \
+    echo "nginx $have satisfies NGINX_MIN_VERSION $NGINX_MIN_VERSION"
 
 RUN apk add --no-cache \
     bash \

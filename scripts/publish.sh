@@ -41,7 +41,8 @@ Usage: $0 <version> [--no-latest] [--force] [--retag-latest-only]
 
     <version>              Semver-style version without leading 'v' (e.g. 0.1.0).
     --no-latest            Do not move :latest / :latest-php (use for back-port releases).
-    --force                Skip the clean-tree, main-branch, and upstream-tag-presence guards.
+    --force                Skip the clean-tree, main-branch, git-tag, and upstream-tag-presence
+                           guards. An existing git tag that marks HEAD needs no --force.
     --retag-latest-only    Skip both builds; only re-promote :latest and :latest-php from
                            the existing :<version>{,-php} tags. Useful when step 5 failed
                            but both versioned builds already shipped. Requires --force.
@@ -122,12 +123,19 @@ if [[ -n "$(git status --porcelain)" && "$FORCE" -ne 1 ]]; then
     exit 1
 fi
 
+# A tag created beforehand (for example when the release commit is prepared
+# and tagged ahead of publishing) is accepted as long as it marks HEAD; the
+# images are then built from exactly the tagged revision. A tag on any other
+# commit means the tree no longer matches the release.
 if git rev-parse --verify --quiet "refs/tags/$GIT_TAG" >/dev/null; then
-    if [[ "$FORCE" -ne 1 ]]; then
-        echo "git tag $GIT_TAG already exists; delete it locally and remotely first, or pass --force" >&2
+    if [[ "$(git rev-parse "$GIT_TAG^{commit}")" == "$(git rev-parse HEAD)" ]]; then
+        echo "==> git tag $GIT_TAG already marks HEAD; publishing that revision"
+    elif [[ "$FORCE" -ne 1 ]]; then
+        echo "git tag $GIT_TAG exists but does not mark HEAD; check out the tagged commit, or delete the tag locally and remotely first, or pass --force" >&2
         exit 1
+    else
+        echo "==> WARNING: git tag $GIT_TAG exists on another commit (continuing because --force)"
     fi
-    echo "==> WARNING: git tag $GIT_TAG already exists (continuing because --force)"
 fi
 
 REVISION="$(git rev-parse HEAD)"
@@ -223,13 +231,16 @@ if [[ "$RETAG_LATEST_ONLY" -ne 1 ]]; then
     if git rev-parse --verify --quiet "refs/tags/$GIT_TAG" >/dev/null; then
         echo "==> git tag $GIT_TAG already exists locally; not retagging"
     else
-        echo "==> tagging and pushing git tag $GIT_TAG"
+        echo "==> tagging git tag $GIT_TAG"
         git tag -a "$GIT_TAG" -m "Release $GIT_TAG"
-        if git config --get remote.origin.url >/dev/null 2>&1; then
-            git push origin "$GIT_TAG"
-        else
-            echo "    no 'origin' remote configured; git tag created locally only" >&2
-        fi
+    fi
+    # Push in both cases: a tag prepared ahead of publishing has usually not
+    # reached origin yet, and pushing a tag origin already has is a no-op.
+    if git config --get remote.origin.url >/dev/null 2>&1; then
+        echo "==> pushing git tag $GIT_TAG"
+        git push origin "$GIT_TAG"
+    else
+        echo "    no 'origin' remote configured; git tag exists locally only" >&2
     fi
 fi
 

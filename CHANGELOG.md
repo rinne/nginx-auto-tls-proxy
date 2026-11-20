@@ -2,6 +2,29 @@
 
 All notable changes to `nginx-auto-tls-proxy` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-11-20
+
+Security release for both tags. Pull and recreate the container; there is
+nothing to configure.
+
+### Security
+
+- Both images ship **nginx 1.31.9**, fixing four flaws that affect every earlier 1.31.x build, including the nginx 1.31.4 in 1.0.0 and the 1.31.8 in 1.0.1:
+  - CVE-2026-123007 ("nginx2root"): memory corruption in HTTP/2 flow control that lets an unauthenticated client execute code. nginx rates it major, public reports rate it CVSS 9.2, and a working exploit has been published. Only HTTP/2 needs to be enabled, and this image enables it on every static, static-php, proxy and redirect site. Layer 4 `TLS_TERMINATOR_PROXY` sites do not speak HTTP/2.
+  - CVE-2026-123633: use-after-free in HTTP/2.
+  - CVE-2026-121810: use-after-free in HTTP/3, reachable on sites listed in `HTTP3_SITES`.
+  - CVE-2026-123634: use-after-free in the resolver, reachable on proxy sites using the default `PROXY_RESOLVER`.
+- nginx's suggested interim mitigation, disabling HTTP/2, is not available here, because the image has no setting for it. Updating is the fix. Running `apk upgrade` inside an older container does not help, because nginx comes from the base image rather than from Alpine's repositories.
+
+### Added
+
+- `ARG NGINX_MIN_VERSION` (default `1.31.9`) in the Dockerfile. The first build step reads the version from the base image's `nginx` binary and fails the build when it is lower, so a stale cached `nginx:alpine` can no longer produce an image with a known-vulnerable nginx. It complements `PHP_MIN_VERSION`: nginx is not installed through apk, so an apk constraint cannot guard it. The floor is raised with every nginx security release and never lowered. Builds overriding `NGINX_IMAGE` with another branch, such as `nginx:stable-alpine`, pass a floor from that branch, for example `1.30.7`.
+
+### Changed
+
+- `scripts/publish.sh` accepts a git tag `v<version>` that already exists, as long as it marks HEAD, so a release commit can be prepared and tagged before publishing. A tag on any other commit is still refused without `--force`. The script now pushes the tag at the end in both cases. Previously a pre-existing tag was refused, and with `--force` it was never pushed.
+- Both images are built from the current `nginx:alpine` (Alpine 3.24 with nginx 1.31.9 at release time). No behaviour or configuration changes.
+
 ## [1.0.1] - 2026-10-22
 
 Security release for the `-php` tag. Pull and recreate the container; there is

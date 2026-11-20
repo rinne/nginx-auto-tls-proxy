@@ -1175,6 +1175,15 @@ docker compose pull && docker compose up -d
 Note that a `ports:` change needs `docker compose up -d` to recreate the
 container — `docker compose restart` will not pick it up.
 
+**1.0.1 → 1.0.2** is a security update for both tags: nginx moves from
+1.31.8 to 1.31.9, fixing CVE-2026-123007, an unauthenticated remote code
+execution flaw in HTTP/2 with a published exploit, plus three use-after-free
+bugs in HTTP/2, HTTP/3 and the resolver. HTTP/2 is enabled on every static,
+PHP, proxy and redirect site, so nearly every deployment is exposed. Pull and recreate as above. Running `apk upgrade`
+inside an older container does not fix it, because nginx comes from the base
+image. Deployments still on 1.0.0 skip straight to 1.0.2 and pick up the PHP fix
+below as well. No configuration changes.
+
 **1.0.0 → 1.0.1** is a security update for the `-php` tag: PHP moves from
 8.5.9 to 8.5.12, fixing CVE-2026-109618 and CVE-2026-109619, two
 unauthenticated remote code execution flaws reported as exploited in the wild.
@@ -1221,7 +1230,19 @@ Local `:-php` image:
 docker build --pull --build-arg WITH_PHP=1 -t nginx-auto-tls-proxy:local-php nginx-auto-tls-proxy
 ```
 
-`--pull` makes Docker resolve `nginx:alpine` from the registry instead of a locally cached copy, which can be months old. A stale base does not produce a stale `-php` image silently: the build fails on the `PHP_MIN_VERSION` floor described under [Bundled PHP version](#bundled-php-version), which is the intended outcome.
+`--pull` makes Docker resolve `nginx:alpine` from the registry instead of a locally cached copy, which can be months old. A stale base does not produce a stale image silently. The build fails on one of two version floors, which is the intended outcome:
+
+- `NGINX_MIN_VERSION` (currently `1.31.9`) is checked against the base image's `nginx` binary in the first build step, for both variants.
+- `PHP_MIN_VERSION` (currently `8.5.12`) applies to the `-php` variant, as described under [Bundled PHP version](#bundled-php-version).
+
+Both floors are raised with every security release of their component and never lowered. When building from another nginx branch, pass a floor from that branch as well:
+
+```bash
+docker build --pull \
+  --build-arg NGINX_IMAGE=nginx:stable-alpine \
+  --build-arg NGINX_MIN_VERSION=1.30.7 \
+  -t nginx-auto-tls-proxy:local-stable nginx-auto-tls-proxy
+```
 
 Dry-run generated config:
 
@@ -1268,7 +1289,7 @@ The script is **ordered, not truly atomic**, by design. `docker buildx build --p
 3. Build & push `:<version>-php` (riskier — extra packages, more failure surface).
 4. Build & push `:<version>` (plain).
 5. Promote moving tags `:latest` and `:latest-php` via `buildx imagetools create` (manifest-only, no rebuild).
-6. `git tag v<version>` and push.
+6. `git tag v<version>` unless it already marks HEAD, then push the tag.
 
 Both builds pass `--pull`, so the published images always start from the registry's current `nginx:alpine`, never a cached copy.
 
@@ -1285,7 +1306,9 @@ Useful environment overrides:
 - `IMAGE` — Docker Hub image name (default `timorinne/nginx-auto-tls-proxy`).
 - `PLATFORMS` — buildx target platforms (default `linux/amd64,linux/arm64`).
 
-When PHP publishes a security release, raise `PHP_MIN_VERSION` in the Dockerfile to the fixed version, record the CVEs in the changelog, and cut a patch release. The floor makes the `-php` build fail loudly if the base image's repositories have not caught up yet, so a release can never ship below it.
+When nginx or PHP publishes a security release, raise `NGINX_MIN_VERSION` or `PHP_MIN_VERSION` in the Dockerfile to the fixed version, record the CVEs in the changelog, and cut a patch release. The floor makes the build fail loudly if the base image or its repositories have not caught up yet, so a release can never ship below it. For nginx, wait until `nginx:alpine` on Docker Hub carries the fixed version; the official image usually follows an nginx release within a day.
+
+The script accepts a `v<version>` git tag created beforehand, as long as it marks HEAD, and pushes it at the end. A tag on any other commit is refused unless `--force` is given.
 
 The CI workflow at `.github/workflows/ci.yml` only runs the smoke tests on pushes and pull requests; it does not publish to Docker Hub.
 
