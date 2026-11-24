@@ -799,7 +799,7 @@ This image ships **PHP 8.5.x** from the Alpine `php85` track. Use it to match `c
 
 Operators who need a different track can rebuild from source with `--build-arg PHP_TRACK=84`. We may bump the default track in a future minor release; that is always a changelog-worthy event.
 
-The build also enforces a **minimum PHP version**. `ARG PHP_MIN_VERSION` (currently `8.5.12`) is applied as an apk version constraint on `php85` and `php85-fpm`, so a base image whose package repositories still carry an older PHP fails the build instead of producing an image with a known-vulnerable interpreter. The floor is raised with every PHP security release, each raise ships as a patch release of this image, and it is never lowered. When overriding `PHP_TRACK`, pass a floor from that series as well, for example `--build-arg PHP_TRACK=84 --build-arg PHP_MIN_VERSION=8.4.27`.
+The build also enforces a **minimum PHP version**. `ARG PHP_MIN_VERSION` (currently `8.5.13`) is applied as an apk version constraint on `php85` and `php85-fpm`, so a base image whose package repositories still carry an older PHP fails the build instead of producing an image with a known-vulnerable interpreter. The floor is raised with every PHP security release, each raise ships as a patch release of this image, and it is never lowered. When overriding `PHP_TRACK`, pass a floor from that series as well, for example `--build-arg PHP_TRACK=84 --build-arg PHP_MIN_VERSION=8.4.27`.
 
 ### Curated extension set
 
@@ -1175,6 +1175,16 @@ docker compose pull && docker compose up -d
 Note that a `ports:` change needs `docker compose up -d` to recreate the
 container — `docker compose restart` will not pick it up.
 
+**1.0.2 → 1.0.3** is a security update for both tags: nginx moves from
+1.31.9 to 1.31.10, fixing CVE-2026-132779 (CPU exhaustion, only reachable when
+a custom snippet turns on `ssl_early_data`) and excessive CPU use with
+`https://` upstreams on proxy sites. The base image's Alpine packages are now
+upgraded at build time, which brings zlib 1.4 (CVE-2026-85091) among others,
+and libxml2 moves to 2.13.9-r3 (CVE-2026-86144, reachable through PHP's XML
+extensions on the `-php` tag). The `-php` tag keeps PHP 8.5.13, which
+1.0.2-php already had; its build floor now requires it. Pull and recreate as
+above. No configuration changes.
+
 **1.0.1 → 1.0.2** is a security update for both tags: nginx moves from
 1.31.8 to 1.31.9, fixing CVE-2026-123007, an unauthenticated remote code
 execution flaw in HTTP/2 with a published exploit, plus three use-after-free
@@ -1232,10 +1242,14 @@ docker build --pull --build-arg WITH_PHP=1 -t nginx-auto-tls-proxy:local-php ngi
 
 `--pull` makes Docker resolve `nginx:alpine` from the registry instead of a locally cached copy, which can be months old. A stale base does not produce a stale image silently. The build fails on one of two version floors, which is the intended outcome:
 
-- `NGINX_MIN_VERSION` (currently `1.31.9`) is checked against the base image's `nginx` binary in the first build step, for both variants.
-- `PHP_MIN_VERSION` (currently `8.5.12`) applies to the `-php` variant, as described under [Bundled PHP version](#bundled-php-version).
+- `NGINX_MIN_VERSION` (currently `1.31.10`) is checked against the base image's `nginx` binary in the first build step, for both variants.
+- `PHP_MIN_VERSION` (currently `8.5.13`) applies to the `-php` variant, as described under [Bundled PHP version](#bundled-php-version).
 
-Both floors are raised with every security release of their component and never lowered. When building from another nginx branch, pass a floor from that branch as well:
+Both floors are raised with every security release of their component and never lowered.
+
+The build then runs `apk upgrade`, so the Alpine packages that come with the base image (zlib and the like) carry Alpine's current fixes even when `nginx:alpine` itself has not been rebuilt for a while. nginx and its modules are pinned to exact versions in the base image, so this never changes the nginx build.
+
+When building from another nginx branch, pass a floor from that branch as well:
 
 ```bash
 docker build --pull \
@@ -1284,14 +1298,14 @@ scripts/publish.sh 0.1.0
 
 The script is **ordered, not truly atomic**, by design. `docker buildx build --push` couples build and push for multi-arch manifests, so the two variants ship sequentially:
 
-1. Pull the current `nginx:alpine`, then smoke tests (plain + `-php`).
-2. Pre-flight: registry check that neither `:<version>` nor `:<version>-php` already exists upstream.
+1. Pre-flight: registry check that neither `:<version>` nor `:<version>-php` already exists upstream.
+2. Pull the current `nginx:alpine`, then smoke tests (plain + `-php`).
 3. Build & push `:<version>-php` (riskier — extra packages, more failure surface).
 4. Build & push `:<version>` (plain).
 5. Promote moving tags `:latest` and `:latest-php` via `buildx imagetools create` (manifest-only, no rebuild).
 6. `git tag v<version>` unless it already marks HEAD, then push the tag.
 
-Both builds pass `--pull`, so the published images always start from the registry's current `nginx:alpine`, never a cached copy.
+Both builds pass `--pull` and `--no-cache`, so the published images always start from the registry's current `nginx:alpine`, never a cached copy, and their packages are installed and upgraded afresh rather than taken from an earlier build's layers.
 
 The moving tags only flip when **both** versioned tags successfully pushed. If a build fails partway, the script's `--help` documents the recovery paths.
 

@@ -13,7 +13,7 @@ ARG IMAGE_VERSION=""
 # nginx. Raise it on every nginx security release (each raise is a patch release
 # of this image); never lower it. When overriding NGINX_IMAGE with another
 # branch, such as nginx:stable-alpine, pass a NGINX_MIN_VERSION from that branch.
-ARG NGINX_MIN_VERSION=1.31.9
+ARG NGINX_MIN_VERSION=1.31.10
 ARG WITH_PHP=0
 ARG PHP_TRACK=85
 # Lowest PHP version the -php image may ship. apk refuses to install anything
@@ -21,7 +21,7 @@ ARG PHP_TRACK=85
 # producing an image with a known-vulnerable PHP. Raise it on every PHP
 # security release (each raise is a patch release of this image); never lower
 # it. When overriding PHP_TRACK, pass a PHP_MIN_VERSION from that series too.
-ARG PHP_MIN_VERSION=8.5.12
+ARG PHP_MIN_VERSION=8.5.13
 
 LABEL org.opencontainers.image.title="${IMAGE_TITLE}" \
       org.opencontainers.image.description="${IMAGE_DESCRIPTION}" \
@@ -40,6 +40,13 @@ RUN set -e ; \
         exit 1 ; \
     fi ; \
     echo "nginx $have satisfies NGINX_MIN_VERSION $NGINX_MIN_VERSION"
+
+# The base image's own Alpine packages (zlib, zstd and others) are only as
+# fresh as its last rebuild, which can lag Alpine's security fixes by weeks.
+# Bring them up to date before adding anything. nginx and its modules are
+# pinned to exact versions in the base image's /etc/apk/world, so this never
+# replaces the nginx.org build with Alpine's own nginx package.
+RUN apk upgrade --no-cache
 
 RUN apk add --no-cache \
     bash \

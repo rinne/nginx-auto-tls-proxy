@@ -2,6 +2,31 @@
 
 All notable changes to `nginx-auto-tls-proxy` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-11-24
+
+Security release for both tags. Pull and recreate the container; there is
+nothing to configure.
+
+### Security
+
+- Both images ship **nginx 1.31.10** (released 2026-11-23; 1.0.2 carried 1.31.9):
+  - CVE-2026-132779: a client could cause excessive CPU usage when the `ssl_early_data` directive is on. The image never turns it on, and nginx leaves it (and with it TLS 1.3 and QUIC 0-RTT) off by default, so only deployments that enable it in a custom snippet were exposed.
+  - nginx could also hog CPU when it used SSL connections to backends, which `PROXY_SITES` entries with an `https://` upstream do.
+- The Alpine packages that come with the base image are now brought up to date during the build. 1.0.2 shipped them as `nginx:alpine` had them, including **zlib 1.3.2**, which is affected by CVE-2026-85091 (heap overflow in non-blocking `gzwrite()`) and the other flaws fixed in zlib 1.4. None of the image's components is known to use zlib's affected gzip file functions (nginx compresses with the stream API), so this is a precaution rather than a known exposure. Both images now ship zlib 1.4 and zstd 1.6.0.
+- Both images ship **libxml2 2.13.9-r3**, fixing CVE-2026-86144 (information disclosure, SSRF or denial of service when parsing untrusted XML; rated high). 1.0.2 carried 2.13.9-r2. nginx does not load its XML module here, but the `-php` image's DOM, SimpleXML and XMLReader extensions parse with libxml2, so PHP applications that read XML from users were exposed.
+- The `-php` image's floor is raised to **PHP 8.5.13** (released 2026-11-19). 1.0.2-php already shipped 8.5.13, because Alpine had it on the day of the build, but its floor still allowed 8.5.12, so a rebuild from a lagging mirror could have gone back. 8.5.13 fixes eighteen vulnerabilities, among them in the components this image runs: PHP-FPM request smuggling through an unread request body (CVE-2026-129289) and an epoll use-after-free (CVE-2026-129291), remote code execution through sessions (CVE-2026-126714, CVE-2026-115560), and use-after-free flaws in the engine and in `ext/date` that can lead to remote code execution (CVE-2026-129474, CVE-2026-129496).
+
+### Changed
+
+- The Dockerfile runs `apk upgrade` before installing its own packages, so Alpine's security fixes reach the image with every build instead of waiting for the next rebuild of `nginx:alpine`. The base image pins nginx and its modules to exact versions, so the nginx.org build is never replaced by Alpine's own `nginx` package.
+- `scripts/publish.sh` builds with `--no-cache` as well as `--pull`. When the base image had not changed since the previous release, cached layers would otherwise have reused that release's packages.
+- `NGINX_MIN_VERSION` defaults to `1.31.10` and `PHP_MIN_VERSION` to `8.5.13`.
+- CI uses `actions/checkout@v7`; v4 ran on the deprecated Node.js 20.
+
+### Fixed
+
+- Both smoke tests failed on Linux after every assertion had passed. The proxy writes its certificates into the tests' bind-mounted directories as root, the cleanup could not remove them as the invoking user, and under `set -e` that ended the script with status 1 and left a `.tmp-smoke.*` directory behind. This is why CI had never passed; Docker Desktop on macOS maps file ownership to the user and hides the problem. The cleanup now hands the files back through a short-lived container before removing them.
+
 ## [1.0.2] - 2026-11-20
 
 Security release for both tags. Pull and recreate the container; there is

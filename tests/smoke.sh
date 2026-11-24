@@ -21,6 +21,11 @@ cleanup() {
     if [[ -n "${H3_COMPOSE_FILE:-}" && -f "$H3_COMPOSE_FILE" ]]; then
         "${H3_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
     fi
+    # The proxy writes its certificates into the bind-mounted ssl directories
+    # as root. On Linux they stay root-owned on the host and the rm below
+    # would fail (and, under set -e, fail the run); hand them back first.
+    docker run --rm -v "$TMP_DIR:/t" nginx:alpine \
+        chown -R "$(id -u):$(id -g)" /t >/dev/null 2>&1 || true
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT

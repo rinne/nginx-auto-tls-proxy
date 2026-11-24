@@ -190,9 +190,14 @@ if [[ "$RETAG_LATEST_ONLY" -ne 1 ]]; then
 
     # Build the riskier variant first. If this fails, registry is unchanged
     # and moving tags are not touched.
+    #
+    # --no-cache: the apk layers must be rebuilt for every release. When the
+    # base image has not changed since the previous build, cached layers
+    # would otherwise ship the packages (and fixes) of that earlier build.
     echo "==> [1/2] building and pushing ${IMAGE}:${VERSION}-php for $PLATFORMS"
     docker buildx build \
         --pull \
+        --no-cache \
         --platform "$PLATFORMS" \
         --build-arg "WITH_PHP=1" \
         --build-arg "IMAGE_VERSION=${VERSION}" \
@@ -205,6 +210,7 @@ if [[ "$RETAG_LATEST_ONLY" -ne 1 ]]; then
     echo "==> [2/2] building and pushing ${IMAGE}:${VERSION} for $PLATFORMS"
     docker buildx build \
         --pull \
+        --no-cache \
         --platform "$PLATFORMS" \
         --build-arg "WITH_PHP=0" \
         --build-arg "IMAGE_VERSION=${VERSION}" \
