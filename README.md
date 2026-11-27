@@ -1175,6 +1175,12 @@ docker compose pull && docker compose up -d
 Note that a `ports:` change needs `docker compose up -d` to recreate the
 container — `docker compose restart` will not pick it up.
 
+**1.0.3 → 1.0.4** is a security update for both tags with no code changes:
+the images are rebuilt with Alpine's latest libxml2 (2.13.9-r5, fixing five
+high-rated overflows among others, reachable through PHP's XML extensions on
+the `-php` tag) and expat (2.11.0). nginx and PHP are unchanged. Pull and
+recreate as above. No configuration changes.
+
 **1.0.2 → 1.0.3** is a security update for both tags: nginx moves from
 1.31.9 to 1.31.10, fixing CVE-2026-132779 (CPU exhaustion, only reachable when
 a custom snippet turns on `ssl_early_data`) and excessive CPU use with

@@ -2,6 +2,20 @@
 
 All notable changes to `nginx-auto-tls-proxy` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-11-27
+
+Security release for both tags, rebuilt with Alpine's latest package fixes.
+Pull and recreate the container; there is nothing to configure.
+
+### Security
+
+- Both images ship **libxml2 2.13.9-r5** (1.0.3 carried 2.13.9-r3). Alpine fixed twelve flaws in it after 1.0.3 was built. Five of them are rated high: heap and stack buffer overflows that can lead to code execution when parsing crafted XML (CVE-2026-86138, CVE-2026-86140), an integer overflow in `xmlURIEscapeStr` (CVE-2026-86139), a heap overflow in XPointer evaluation (CVE-2026-86142), and an integer overflow in the output write callbacks (CVE-2026-86143). The others are denial-of-service bugs in XML catalogs, RelaxNG includes and regular expression parsing. As with 1.0.3, nginx does not load its XML modules here, so the plain image is not known to be exposed. The `-php` image's DOM, SimpleXML, XMLReader and XMLWriter extensions use libxml2, so PHP applications that handle XML from users were. CVE-2026-11979 and CVE-2026-1757 are in the `xmlcatalog` and `xmllint` tools, which the images do not contain.
+- Both images ship **expat 2.11.0** (1.0.3 carried 2.10.0), fixing an out-of-bounds read in the unknown-encoding decoder (CVE-2026-124317) and improper handling of malformed UTF-16 (CVE-2026-134703), both rated medium. In these images expat is used by certbot's Python and by fontconfig, neither of which parses XML from clients. CVE-2026-128241 is in the `xmlwf` tool, which the images do not contain.
+
+### Changed
+
+- No changes to the code or configuration. nginx stays at 1.31.10 and the `-php` image at PHP 8.5.13; libxml2 and expat are the only packages that differ from 1.0.3.
+
 ## [1.0.3] - 2026-11-24
 
 Security release for both tags. Pull and recreate the container; there is
