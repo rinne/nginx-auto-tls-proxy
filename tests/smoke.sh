@@ -48,14 +48,30 @@ services:
       - "$TMP_DIR/sites:/sites"
       - "$TMP_DIR/custom:/custom/custom.local"
     environment:
-      STATIC_SITES: "default.local,custom.local,allowed.local,locked.local"
+      # Several list values are YAML block scalars on purpose: since 1.1.0 the
+      # whole value is read, and whitespace and line breaks around separators
+      # are ignored (1.0.x silently dropped everything after the first line).
+      STATIC_SITES: |
+        default.local,
+        custom.local,
+        allowed.local,
+        locked.local
       STATIC_SITE_ROOTS: "custom.local:/custom/custom.local"
-      PROXY_SITES: "proxy.local:http://backend/"
+      PROXY_SITES: |
+        proxy.local :
+          http://backend/
       SITE_ALIASES: "default.local:www.default.local"
-      SITE_REDIRECTS: "shallow.local:default.local,deep.local:default.local:deep,explicit.local:default.local:no-deep"
+      SITE_REDIRECTS: |
+        shallow.local : default.local ,
+        deep.local : default.local : deep ,
+        explicit.local : default.local : no-deep
       SITE_REWRITES: |
         default.local ^/code/([A-Z]{4}-[A-Z]{4})\$ /landing.html
-      SITE_ALLOWED_IPS: "allowed.local:10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,[2001:db8::/32];locked.local:10.255.255.0/24,[2001:db8::/32]"
+      SITE_ALLOWED_IPS: |
+        allowed.local: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, [2001:db8::/32];
+        locked.local:
+          10.255.255.0/24,
+          [2001:db8::/32]
       DEFAULT_SITE: "default.local"
       HSTS_MAX_AGE: "31536000"
       STATIC_FALLBACK_PAGES: "1"
@@ -706,6 +722,51 @@ docker run --rm \
 true
 ' | grep -q 'must be a configured site or alias' \
     || { printf 'FAIL: should reject SITE_REWRITES for an unknown host\n'; exit 1; }
+
+# --- Multi-line list values (DRY_RUN) ---
+# Whitespace and line breaks around ',', ';' and ':' are ignored, so a value
+# spread over lines generates exactly the config of its one-line form. Only
+# the first ':' of a PROXY_SITES entry separates; the URL keeps its own.
+docker run --rm \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+gen() {
+    env "$@" /entrypoint.sh >/dev/null 2>&1 || { echo "FAIL: entrypoint rejected: $*"; exit 1; }
+    cat /etc/nginx/conf.d/*.conf /etc/nginx/site-conf.d/*.conf 2>/dev/null | sha256sum
+    rm -f /etc/nginx/conf.d/nginx-auto-tls-proxy-* /etc/nginx/site-conf.d/*
+}
+one="$(gen STATIC_SITES=a.local,b.local \
+    PROXY_SITES=p.local:http://127.0.0.1:3000/ \
+    SITE_REDIRECTS=r.local:a.local:deep \
+    SITE_ALLOWED_IPS="a.local:10.0.0.0/8,[2001:db8::/32];b.local:192.168.0.0/16")"
+multi="$(gen STATIC_SITES="
+    a.local ,
+    b.local
+" PROXY_SITES="
+    p.local :
+        http://127.0.0.1:3000/
+" SITE_REDIRECTS="
+    r.local : a.local :
+        deep
+" SITE_ALLOWED_IPS="
+    a.local :
+        10.0.0.0/8 ,
+        [2001:db8::/32] ;
+    b.local : 192.168.0.0/16
+")"
+[ "$one" = "$multi" ] || { echo "FAIL: multi-line list values generate a different config"; exit 1; }
+'
+
+# Negative: a line break is not a separator; a missing comma is an error, not
+# a silently dropped site.
+docker run --rm \
+    -e PROXY_SITES=$'a.local:http://127.0.0.1:3000/\nb.local:http://127.0.0.1:3001/' \
+    -e DRY_RUN=1 \
+    --entrypoint bash "$PORT_IMG" -c '
+/entrypoint.sh 2>&1 && { echo "FAIL: should have rejected a missing comma"; exit 1; }
+true
+' | grep -q 'Invalid upstream URL for a.local in PROXY_SITES' \
+    || { printf 'FAIL: should reject PROXY_SITES entries on separate lines without a comma\n'; exit 1; }
 
 # --- SITE_ALLOWED_IPS config generation & validation (DRY_RUN) ---
 # Positive: a rule written against an ALIAS lands on the owner's HTTPS block,

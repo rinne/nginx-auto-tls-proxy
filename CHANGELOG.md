@@ -2,6 +2,25 @@
 
 All notable changes to `nginx-auto-tls-proxy` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-11-28
+
+List variables may now span several lines. Pull and recreate the container;
+before upgrading, check any value that already contains line breaks (see
+Changed).
+
+### Added
+
+- Whitespace around the separators of every list variable is ignored, and line breaks count as whitespace: the `,` between entries, the `;` between `SITE_ALLOWED_IPS` groups, and the `:` between the fields of an entry. Long values can be written one entry per line, for example as a YAML block scalar (`PROXY_SITES: |`) in compose. Commas are still required between entries; a line break alone is not a separator. Only separators are trimmed: where only the first `:` of an entry separates (`PROXY_SITES`, `STATIC_SITE_ROOTS`, `BASIC_AUTH_FILES`, `HTTPS_PORT_OVERRIDE`, the host of `SITE_ALLOWED_IPS` and `PROXY_STREAM_PATHS`), the colons of the value, such as those of an upstream URL, are part of it, and whitespace inside a value is still invalid. The README has a new section, "Long values on several lines".
+
+### Fixed
+
+- Every list variable except `SITE_REWRITES` was read only up to its first line break, and the rest of the value was silently ignored. A value that started with a line break, as in `PROXY_SITES: |` followed by indented entries, configured no sites at all, without an error. For `SITE_ALLOWED_IPS` this failed open: the allow list of any group after the first line was dropped, so those sites accepted every client. The whole value is now read, so all 13 list variables (`STATIC_SITES`, `STATIC_PHP_SITES`, `PROXY_SITES`, `SITE_REDIRECTS`, `TLS_TERMINATOR_PROXY`, `SITE_ALIASES`, `STATIC_SITE_ROOTS`, `BASIC_AUTH_FILES`, `SITE_ALLOWED_IPS`, `HTTPS_PORT_OVERRIDE`, `PROXY_STREAM_PATHS`, `HTTP3_SITES`, `REAL_IP_FROM`) see every entry. Values on one line generate exactly the same configuration as in 1.0.4.
+
+### Changed
+
+- A value that contains line breaks is now read in full. If such a value worked under 1.0.x only because its later lines were ignored, those lines now take effect, or stop the container with an error if they are malformed (for example, entries on separate lines without a comma between them). Run the new image once with `DRY_RUN=1` to see the site plan before switching.
+- `tests/smoke.sh` writes several of its list values as YAML block scalars, and checks that a multi-line value generates the same configuration as its one-line form and that a missing comma between lines is rejected.
+
 ## [1.0.4] - 2026-11-27
 
 Security release for both tags, rebuilt with Alpine's latest package fixes.

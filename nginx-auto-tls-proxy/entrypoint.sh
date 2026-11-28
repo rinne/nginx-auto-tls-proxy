@@ -18,6 +18,18 @@ trim_spaces() {
     printf '%s' "$value"
 }
 
+# split_list <separator> <value> <array-name>: split value on the one-character
+# separator into the named array. The whole value is read, line breaks
+# included, so list variables may span several lines (YAML block scalars,
+# multi-line quoted values); `IFS=, read -ra x <<< "$v"` stopped at the first
+# line break and silently dropped the rest. Fields keep their surrounding
+# whitespace (line breaks too) for the caller's trim_spaces, and as before an
+# empty last field is dropped.
+split_list() {
+    local -n _split_out="$3"
+    IFS="$1" read -rd '' -a _split_out < <(printf '%s' "$2") || true
+}
+
 lower() {
     printf '%s' "${1,,}"
 }
@@ -334,10 +346,12 @@ declare -a PROXY_SITES_ARR=()
 declare -a REDIRECT_SITES_ARR=()
 declare -a TLS_TERM_SITES_ARR=()
 declare -a ALL_SITES=()
+# Scratch arrays filled by split_list.
+declare -a _parts=() _fields=() _ip_groups=() _ips=() _real_ip_sources=()
 
 # Static sites: STATIC_SITES=domain.com,domain2.com
 if [[ -n "${STATIC_SITES:-}" ]]; then
-    IFS=',' read -ra _parts <<< "$STATIC_SITES"
+    split_list ',' "$STATIC_SITES" _parts
     for _p in "${_parts[@]}"; do
         _site="$(lower "$(trim_spaces "$_p")")"
         [[ -z "$_site" ]] && continue
@@ -357,7 +371,7 @@ if [[ -n "${STATIC_PHP_SITES:-}" ]]; then
     if ! command -v php-fpm >/dev/null 2>&1; then
         die "STATIC_PHP_SITES is set but this image was built without PHP support; use the nginx-auto-tls-proxy:<ver>-php tag"
     fi
-    IFS=',' read -ra _parts <<< "$STATIC_PHP_SITES"
+    split_list ',' "$STATIC_PHP_SITES" _parts
     for _p in "${_parts[@]}"; do
         _site="$(lower "$(trim_spaces "$_p")")"
         [[ -z "$_site" ]] && continue
@@ -373,7 +387,7 @@ fi
 
 # Proxy sites: PROXY_SITES=app.com:http://backend:3000/
 if [[ -n "${PROXY_SITES:-}" ]]; then
-    IFS=',' read -ra _parts <<< "$PROXY_SITES"
+    split_list ',' "$PROXY_SITES" _parts
     for _p in "${_parts[@]}"; do
         _p="$(trim_spaces "$_p")"
         [[ -z "$_p" ]] && continue
@@ -397,11 +411,11 @@ fi
 # or 'deep' (redirects to https://destination + the original request URI).
 # Destination is a bare hostname; scheme is implicitly https.
 if [[ -n "${SITE_REDIRECTS:-}" ]]; then
-    IFS=',' read -ra _parts <<< "$SITE_REDIRECTS"
+    split_list ',' "$SITE_REDIRECTS" _parts
     for _p in "${_parts[@]}"; do
         _p="$(trim_spaces "$_p")"
         [[ -z "$_p" ]] && continue
-        IFS=':' read -ra _fields <<< "$_p"
+        split_list ':' "$_p" _fields
         if [[ ${#_fields[@]} -lt 2 || ${#_fields[@]} -gt 3 ]]; then
             die "Malformed SITE_REDIRECTS entry, expected source:destination[:mode]: $_p"
         fi
@@ -430,11 +444,11 @@ fi
 
 # TLS terminator proxy: TLS_TERMINATOR_PROXY=host:port:backend_host:backend_port[:proxy_protocol]
 if [[ -n "${TLS_TERMINATOR_PROXY:-}" ]]; then
-    IFS=',' read -ra _parts <<< "$TLS_TERMINATOR_PROXY"
+    split_list ',' "$TLS_TERMINATOR_PROXY" _parts
     for _p in "${_parts[@]}"; do
         _p="$(trim_spaces "$_p")"
         [[ -z "$_p" ]] && continue
-        IFS=':' read -ra _fields <<< "$_p"
+        split_list ':' "$_p" _fields
         if [[ ${#_fields[@]} -lt 4 || ${#_fields[@]} -gt 5 ]]; then
             die "Malformed TLS_TERMINATOR_PROXY entry, expected host:port:backend_host:backend_port[:proxy_protocol]: $_p"
         fi
@@ -471,7 +485,7 @@ fi
 # Aliases: SITE_ALIASES=domain.com:www.domain.com,old.example.com,domain2.com:www.domain2.com
 if [[ -n "${SITE_ALIASES:-}" ]]; then
     _current_site=""
-    IFS=',' read -ra _parts <<< "$SITE_ALIASES"
+    split_list ',' "$SITE_ALIASES" _parts
     for _p in "${_parts[@]}"; do
         _p="$(trim_spaces "$_p")"
         [[ -z "$_p" ]] && continue
@@ -496,7 +510,7 @@ fi
 # Custom roots for static sites: STATIC_SITE_ROOTS=domain.com:/custom/htdocs
 # Also valid for STATIC_PHP_SITES entries.
 if [[ -n "${STATIC_SITE_ROOTS:-}" ]]; then
-    IFS=',' read -ra _parts <<< "$STATIC_SITE_ROOTS"
+    split_list ',' "$STATIC_SITE_ROOTS" _parts
     for _p in "${_parts[@]}"; do
         _p="$(trim_spaces "$_p")"
         [[ -z "$_p" ]] && continue
@@ -515,7 +529,7 @@ fi
 
 # Optional basic auth: BASIC_AUTH_FILES=domain.com:/run/secrets/domain.htpasswd
 if [[ -n "${BASIC_AUTH_FILES:-}" ]]; then
-    IFS=',' read -ra _parts <<< "$BASIC_AUTH_FILES"
+    split_list ',' "$BASIC_AUTH_FILES" _parts
     for _p in "${_parts[@]}"; do
         _p="$(trim_spaces "$_p")"
         [[ -z "$_p" ]] && continue
@@ -601,7 +615,7 @@ fi
 # block. TLS-terminator sites are rejected (no HTTP layer to return 403).
 # Absence of any entry for a site means all client IPs are allowed (the default).
 if [[ -n "${SITE_ALLOWED_IPS:-}" ]]; then
-    IFS=';' read -ra _ip_groups <<< "$SITE_ALLOWED_IPS"
+    split_list ';' "$SITE_ALLOWED_IPS" _ip_groups
     for _g in "${_ip_groups[@]}"; do
         _g="$(trim_spaces "$_g")"
         [[ -z "$_g" ]] && continue
@@ -615,7 +629,7 @@ if [[ -n "${SITE_ALLOWED_IPS:-}" ]]; then
         [[ "$(site_mode "$_ip_owner")" == "tls-terminator" ]] \
             && die "SITE_ALLOWED_IPS cannot be used with TLS_TERMINATOR_PROXY site: $_ip_owner (no HTTP layer to return 403)"
         _ip_count=0
-        IFS=',' read -ra _ips <<< "$_ip_list"
+        split_list ',' "$_ip_list" _ips
         for _ip in "${_ips[@]}"; do
             _ip="$(trim_spaces "$_ip")"
             [[ -z "$_ip" ]] && continue
@@ -639,7 +653,7 @@ fi
 
 # HTTPS port overrides: HTTPS_PORT_OVERRIDE=host:port,...
 if [[ -n "${HTTPS_PORT_OVERRIDE:-}" ]]; then
-    IFS=',' read -ra _parts <<< "$HTTPS_PORT_OVERRIDE"
+    split_list ',' "$HTTPS_PORT_OVERRIDE" _parts
     for _p in "${_parts[@]}"; do
         _p="$(trim_spaces "$_p")"
         [[ -z "$_p" ]] && continue
@@ -756,7 +770,7 @@ FASTCGI_READ_TIMEOUT_SECONDS=$((PHP_MAX_EXECUTION_TIME + 30))
 # Parsed here rather than beside the other per-site variables because the
 # PROXY_RESOLVER validation below needs the resolved resolver mode.
 if [[ -n "${PROXY_STREAM_PATHS:-}" ]]; then
-    IFS=',' read -ra _parts <<< "$PROXY_STREAM_PATHS"
+    split_list ',' "$PROXY_STREAM_PATHS" _parts
     for _p in "${_parts[@]}"; do
         _p="$(trim_spaces "$_p")"
         [[ -z "$_p" ]] && continue
@@ -817,7 +831,7 @@ if [[ -n "$HTTP3_SITES_RAW" ]]; then
     else
         [[ "$HTTP3_SITES_RAW" == *"*"* ]] \
             && die "HTTP3_SITES '*' selects every site and cannot be combined with other entries; got: $HTTP3_SITES_RAW"
-        IFS=',' read -ra _parts <<< "$HTTP3_SITES_RAW"
+        split_list ',' "$HTTP3_SITES_RAW" _parts
         for _p in "${_parts[@]}"; do
             _h3_host="$(lower "$(trim_spaces "$_p")")"
             [[ -z "$_h3_host" ]] && continue
@@ -942,7 +956,7 @@ generate_real_ip_config() {
     [[ -n "${REAL_IP_FROM:-}" ]] || return 0
     local conf="/etc/nginx/conf.d/nginx-auto-tls-proxy-01-real-ip.conf"
     : > "$conf"
-    IFS=',' read -ra _real_ip_sources <<< "$REAL_IP_FROM"
+    split_list ',' "$REAL_IP_FROM" _real_ip_sources
     local source
     for source in "${_real_ip_sources[@]}"; do
         source="$(trim_spaces "$source")"

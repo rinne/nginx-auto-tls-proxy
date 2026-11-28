@@ -133,6 +133,41 @@ docker compose -f dc/try/docker-compose.yaml down -v
 | `LE_RENEW_BEFORE_DAYS` | `30` | Existing LE certs are reused until this close to expiry. |
 | `DRY_RUN` | `1` | Generates config, prints the site plan, runs `nginx -t`, and exits before starting nginx/certbot. |
 
+### Long values on several lines
+
+Whitespace around the separators of the list variables is ignored, and
+line breaks count as whitespace. That covers the `,` between entries, the
+`;` between `SITE_ALLOWED_IPS` groups, and the `:` between the fields of an
+entry. Long lists can therefore be written one entry per line:
+
+```yaml
+    environment:
+      PROXY_SITES: |
+        app.example.com : http://app:3000/,
+        api.example.com : http://api:8080/
+      SITE_ALLOWED_IPS: |
+        admin.example.com: 10.0.0.0/8, [2001:db8::/32];
+        intranet.example.com: 192.168.0.0/16
+```
+
+Two rules keep this unambiguous:
+
+- **A line break is not a separator.** Entries still need their commas (and
+  `SITE_ALLOWED_IPS` groups their semicolons). Two entries on separate lines
+  without a comma between them are an error, so the container refuses to
+  start rather than dropping a site.
+- **Only separators are trimmed, not values.** In `PROXY_SITES`,
+  `STATIC_SITE_ROOTS`, `BASIC_AUTH_FILES`, `HTTPS_PORT_OVERRIDE` and the host
+  part of `SITE_ALLOWED_IPS` and `PROXY_STREAM_PATHS`, only the first `:`
+  separates the host from the rest, so the colons of a URL such as
+  `http://app:3000/` belong to the URL. Whitespace inside a value, as in
+  `http://app : 3000/`, is invalid.
+
+`SITE_REWRITES` is different by design: it is one rule per line (see
+[Internal Rewrites](#internal-rewrites)). Releases before 1.1.0 read only the
+first line of every other list variable and silently ignored the rest, so
+keep values on one line if the container may run an older image.
+
 ## Static Sites
 
 Static sites are rooted at `/sites/<domain>` by default. If the directory has no `index.html`, startup creates a small placeholder page so the site is immediately testable.
@@ -1174,6 +1209,15 @@ docker compose pull && docker compose up -d
 
 Note that a `ports:` change needs `docker compose up -d` to recreate the
 container — `docker compose restart` will not pick it up.
+
+**1.0.4 → 1.1.0** lets list variables span several lines: whitespace and
+line breaks around their separators are ignored (see
+[Long values on several lines](#long-values-on-several-lines)). It also fixes
+1.0.x reading only the first line of a multi-line value and silently ignoring
+the rest, which for `SITE_ALLOWED_IPS` dropped the allow lists on later lines.
+One-line values behave exactly as before. If any of your values already
+contains line breaks, its later lines now take effect, so check the site plan
+with `DRY_RUN=1` first. Pull and recreate as above.
 
 **1.0.3 → 1.0.4** is a security update for both tags with no code changes:
 the images are rebuilt with Alpine's latest libxml2 (2.13.9-r5, fixing five
