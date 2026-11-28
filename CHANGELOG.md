@@ -4,22 +4,25 @@ All notable changes to `nginx-auto-tls-proxy` are recorded here. The format foll
 
 ## [1.1.0] - 2026-11-28
 
-List variables may now span several lines. Pull and recreate the container;
-before upgrading, check any value that already contains line breaks (see
-Changed).
+Whitespace around values is ignored, and list variables may span several
+lines. Pull and recreate the container; before upgrading, check any value
+that already contains line breaks (see Changed).
 
 ### Added
 
 - Whitespace around the separators of every list variable is ignored, and line breaks count as whitespace: the `,` between entries, the `;` between `SITE_ALLOWED_IPS` groups, and the `:` between the fields of an entry. Long values can be written one entry per line, for example as a YAML block scalar (`PROXY_SITES: |`) in compose. Commas are still required between entries; a line break alone is not a separator. Only separators are trimmed: where only the first `:` of an entry separates (`PROXY_SITES`, `STATIC_SITE_ROOTS`, `BASIC_AUTH_FILES`, `HTTPS_PORT_OVERRIDE`, the host of `SITE_ALLOWED_IPS` and `PROXY_STREAM_PATHS`), the colons of the value, such as those of an upstream URL, are part of it, and whitespace inside a value is still invalid. The README has a new section, "Long values on several lines".
+- Whitespace around the value of every other setting is ignored too, line breaks included. `HSTS_MAX_AGE=" 31536000"` or `CLIENT_MAX_BODY_SIZE` written as a YAML block scalar, which ends in a line break, used to stop the container with a validation error; a value of only whitespace now means the default, as an empty one always did.
+- `DRY_RUN`, `LETSENCRYPT_DISABLE` and `LETSENCRYPT_STAGING` log a warning when they are set to anything but `0`, `1` or empty. They are switched on only by `1`, and a value such as `true` has always meant off without saying so.
 
 ### Fixed
 
 - Every list variable except `SITE_REWRITES` was read only up to its first line break, and the rest of the value was silently ignored. A value that started with a line break, as in `PROXY_SITES: |` followed by indented entries, configured no sites at all, without an error. For `SITE_ALLOWED_IPS` this failed open: the allow list of any group after the first line was dropped, so those sites accepted every client. The whole value is now read, so all 13 list variables (`STATIC_SITES`, `STATIC_PHP_SITES`, `PROXY_SITES`, `SITE_REDIRECTS`, `TLS_TERMINATOR_PROXY`, `SITE_ALIASES`, `STATIC_SITE_ROOTS`, `BASIC_AUTH_FILES`, `SITE_ALLOWED_IPS`, `HTTPS_PORT_OVERRIDE`, `PROXY_STREAM_PATHS`, `HTTP3_SITES`, `REAL_IP_FROM`) see every entry. Values on one line generate exactly the same configuration as in 1.0.4.
+- `DRY_RUN`, `LETSENCRYPT_DISABLE` and `LETSENCRYPT_STAGING` were off unless their value was exactly `1`, so a stray space switched them off silently: `DRY_RUN=" 1"` started nginx and certbot for real, `LETSENCRYPT_DISABLE=" 1"` left Let's Encrypt on, and `LETSENCRYPT_STAGING=" 1"` used the production ACME server and its rate limits. They are now trimmed like every other setting.
 
 ### Changed
 
 - A value that contains line breaks is now read in full. If such a value worked under 1.0.x only because its later lines were ignored, those lines now take effect, or stop the container with an error if they are malformed (for example, entries on separate lines without a comma between them). Run the new image once with `DRY_RUN=1` to see the site plan before switching.
-- `tests/smoke.sh` writes several of its list values as YAML block scalars, and checks that a multi-line value generates the same configuration as its one-line form and that a missing comma between lines is rejected.
+- `tests/smoke.sh` writes several of its list values as YAML block scalars. It checks that a multi-line value generates the same configuration as its one-line form, that a missing comma between lines is rejected, that settings with surrounding whitespace (including `DRY_RUN=" 1"`) behave like their bare values, and that `LETSENCRYPT_DISABLE=true` warns.
 
 ## [1.0.4] - 2026-11-27
 

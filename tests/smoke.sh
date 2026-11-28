@@ -738,7 +738,7 @@ gen() {
 one="$(gen STATIC_SITES=a.local,b.local \
     PROXY_SITES=p.local:http://127.0.0.1:3000/ \
     SITE_REDIRECTS=r.local:a.local:deep \
-    SITE_ALLOWED_IPS="a.local:10.0.0.0/8,[2001:db8::/32];b.local:192.168.0.0/16")"
+    SITE_ALLOWED_IPS="a.local:10.0.0.0/8,[2001:db8::/32];b.local:192.168.0.0/16")" || { echo "$one"; exit 1; }
 multi="$(gen STATIC_SITES="
     a.local ,
     b.local
@@ -753,7 +753,7 @@ multi="$(gen STATIC_SITES="
         10.0.0.0/8 ,
         [2001:db8::/32] ;
     b.local : 192.168.0.0/16
-")"
+")" || { echo "$multi"; exit 1; }
 [ "$one" = "$multi" ] || { echo "FAIL: multi-line list values generate a different config"; exit 1; }
 '
 
@@ -767,6 +767,39 @@ docker run --rm \
 true
 ' | grep -q 'Invalid upstream URL for a.local in PROXY_SITES' \
     || { printf 'FAIL: should reject PROXY_SITES entries on separate lines without a comma\n'; exit 1; }
+
+# --- Whitespace around single-value settings (DRY_RUN) ---
+# Every setting is trimmed before use, line breaks included: spaced values
+# generate the config of their bare form, and DRY_RUN=" 1" still means dry run
+# (`timeout` stops the entrypoint if it starts nginx instead).
+docker run --rm \
+    -e DRY_RUN=$' 1\n' \
+    --entrypoint bash "$PORT_IMG" -c '
+gen() {
+    timeout 30 env "$@" /entrypoint.sh >/tmp/log 2>&1
+    grep -q "ERROR" /tmp/log && { echo "FAIL: entrypoint rejected: $*"; cat /tmp/log; exit 1; }
+    grep -q "DRY_RUN=1 set" /tmp/log || { echo "FAIL: DRY_RUN with surrounding whitespace was not honoured: $*"; exit 1; }
+    cat /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf 2>/dev/null | sha256sum
+    rm -f /etc/nginx/conf.d/nginx-auto-tls-proxy-*
+}
+bare="$(gen STATIC_SITES=a.local DEFAULT_SITE=a.local HSTS_MAX_AGE=31536000 \
+    CLIENT_MAX_BODY_SIZE=32m PROXY_READ_TIMEOUT=90s STRICT_SNI=0 \
+    REAL_IP_FROM=10.0.0.0/8 REAL_IP_HEADER=X-Real-IP)" || { echo "$bare"; exit 1; }
+spaced="$(gen STATIC_SITES=" a.local " DEFAULT_SITE=" a.local" HSTS_MAX_AGE=" 31536000 " \
+    CLIENT_MAX_BODY_SIZE="32m
+" PROXY_READ_TIMEOUT="	90s" STRICT_SNI=" 0" \
+    REAL_IP_FROM=" 10.0.0.0/8" REAL_IP_HEADER="X-Real-IP ")" || { echo "$spaced"; exit 1; }
+[ "$bare" = "$spaced" ] || { echo "FAIL: settings with surrounding whitespace generate a different config"; exit 1; }
+' || { printf 'FAIL: whitespace around single-value settings\n'; exit 1; }
+
+# An on/off switch set to anything but 0 or 1 still means off, but now says so.
+switch_log="$(docker run --rm \
+    -e STATIC_SITES="a.local" \
+    -e LETSENCRYPT_DISABLE=true \
+    -e DRY_RUN=1 \
+    "$PORT_IMG" 2>&1)" || true
+grep -q 'LETSENCRYPT_DISABLE=true is treated as 0 (off)' <<< "$switch_log" \
+    || { printf 'FAIL: LETSENCRYPT_DISABLE=true should warn that it is treated as 0\n'; exit 1; }
 
 # --- SITE_ALLOWED_IPS config generation & validation (DRY_RUN) ---
 # Positive: a rule written against an ALIAS lands on the owner's HTTPS block,

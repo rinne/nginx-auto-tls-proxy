@@ -164,9 +164,18 @@ Two rules keep this unambiguous:
   `http://app : 3000/`, is invalid.
 
 `SITE_REWRITES` is different by design: it is one rule per line (see
-[Internal Rewrites](#internal-rewrites)). Releases before 1.1.0 read only the
-first line of every other list variable and silently ignored the rest, so
-keep values on one line if the container may run an older image.
+[Internal Rewrites](#internal-rewrites)).
+
+Whitespace around the value of every other setting is ignored as well, so
+`HSTS_MAX_AGE: " 31536000"` or a block scalar (which ends in a line break)
+works. The switches `DRY_RUN`, `LETSENCRYPT_DISABLE` and
+`LETSENCRYPT_STAGING` are on only when set to `1`; any other value except `0`
+or empty logs a warning that it is treated as off.
+
+Releases before 1.1.0 read only the first line of every list variable and
+silently ignored the rest, and took a switch with a stray space, such as
+`DRY_RUN=" 1"`, as off. Keep values on one line and unpadded if the container
+may run an older image.
 
 ## Static Sites
 
@@ -1210,12 +1219,14 @@ docker compose pull && docker compose up -d
 Note that a `ports:` change needs `docker compose up -d` to recreate the
 container — `docker compose restart` will not pick it up.
 
-**1.0.4 → 1.1.0** lets list variables span several lines: whitespace and
-line breaks around their separators are ignored (see
-[Long values on several lines](#long-values-on-several-lines)). It also fixes
-1.0.x reading only the first line of a multi-line value and silently ignoring
-the rest, which for `SITE_ALLOWED_IPS` dropped the allow lists on later lines.
-One-line values behave exactly as before. If any of your values already
+**1.0.4 → 1.1.0** ignores whitespace around values and lets list variables
+span several lines: whitespace and line breaks around their separators are
+ignored (see [Long values on several lines](#long-values-on-several-lines)).
+It also fixes 1.0.x reading only the first line of a multi-line value and
+silently ignoring the rest, which for `SITE_ALLOWED_IPS` dropped the allow
+lists on later lines, and taking `DRY_RUN`, `LETSENCRYPT_DISABLE` or
+`LETSENCRYPT_STAGING` with a stray space as off. One-line, unpadded values
+behave exactly as before. If any of your values already
 contains line breaks, its later lines now take effect, so check the site plan
 with `DRY_RUN=1` first. Pull and recreate as above.
 

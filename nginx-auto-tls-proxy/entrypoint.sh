@@ -306,6 +306,35 @@ deploy_existing_le_cert() {
     RENEWED_LINEAGE="$lineage" /usr/local/bin/certbot-deploy.sh || return 1
 }
 
+# Whitespace around a setting's value is ignored, line breaks included:
+# `HSTS_MAX_AGE=" 31536000"` and a YAML block scalar ending in a newline mean
+# the same as the bare value. Done once here, before anything reads them, so
+# every check and every generated directive sees the trimmed value. List
+# variables are additionally trimmed per entry and field as they are split.
+for _setting in \
+    STATIC_SITES STATIC_PHP_SITES PROXY_SITES SITE_REDIRECTS SITE_REWRITES \
+    TLS_TERMINATOR_PROXY SITE_ALIASES STATIC_SITE_ROOTS BASIC_AUTH_FILES \
+    SITE_ALLOWED_IPS DEFAULT_SITE HTTPS_PORT_OVERRIDE PROXY_STREAM_PATHS \
+    HTTP3_SITES REAL_IP_FROM REAL_IP_HEADER \
+    CLIENT_MAX_BODY_SIZE PROXY_READ_TIMEOUT PROXY_SEND_TIMEOUT \
+    PROXY_RESOLVER PROXY_RESOLVER_VALID \
+    HSTS_MAX_AGE OCSP_STAPLING STRICT_SNI STATIC_FALLBACK_PAGES \
+    LETSENCRYPT_EMAIL LETSENCRYPT_DISABLE LETSENCRYPT_STAGING \
+    LETSENCRYPT_RENEW_INTERVAL_SECONDS LE_RENEW_BEFORE_DAYS \
+    PHP_MEMORY_LIMIT PHP_MAX_EXECUTION_TIME PHP_FPM_PROFILE \
+    DRY_RUN; do
+    [[ -n "${!_setting+isset}" ]] && printf -v "$_setting" '%s' "$(trim_spaces "${!_setting}")"
+done
+
+# On/off switches that are only ever compared with "1". Anything else has
+# always meant off; say so instead of silently ignoring, e.g., "true".
+for _setting in DRY_RUN LETSENCRYPT_DISABLE LETSENCRYPT_STAGING; do
+    case "${!_setting:-}" in
+        ""|0|1) ;;
+        *) warn "$_setting=${!_setting} is treated as 0 (off); set it to 1 to turn it on" ;;
+    esac
+done
+
 # Basic volume and directory setup.
 if ! grep -qs " /ssl " /proc/mounts 2>/dev/null; then
     warn "/ssl is not mounted as a volume. TLS certificates will not persist across restarts."
