@@ -2,6 +2,21 @@
 
 All notable changes to `nginx-auto-tls-proxy` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-11-28
+
+Long hostnames and many proxy sites no longer stop nginx from starting. Pull
+and recreate the container; there is nothing to configure.
+
+### Fixed
+
+- nginx refused to start (`[emerg] could not build variables_hash`) when a `PROXY_SITES` hostname had 38 or more characters, or a `TLS_TERMINATOR_PROXY` hostname 39 or more, even as the only site. With the default `PROXY_RESOLVER`, every proxy and TLS terminator site had its own nginx variable named after its hostname (`$upstream_<host>`, `$backend_<host>`), and nginx keeps variable names in a hash with 64-byte buckets. From about 20 proxy sites with shorter names, nginx also warned at every start that it "could not build optimal variables_hash". All sites now share one variable name (`$natp_upstream` for proxy sites, `$natp_backend` for TLS terminators); `set` assigns it per request in each site's own block, so routing is unchanged.
+- nginx refused to start (`[emerg] could not build server_names_hash`) when any site or alias name had 47 or more characters, because the default `server_names_hash_bucket_size` of 64 is too small for it. It is now 512, which fits any valid hostname (up to 253 characters).
+- A site name of more than 64 characters stopped the container, because the self-signed fallback certificate put it in the certificate's common name, which X.509 limits to 64 characters. Such names now go only into the subject alternative name, which is what clients check; the common name is `nginx-auto-tls-proxy`. Shorter names keep their common name.
+
+### Changed
+
+- `tests/smoke.sh` checks a dry run with a 253-character static site, 68-to-72-character proxy, static, alias, redirect, TLS terminator and stream-path names, and 100 more proxy sites, and fails on any nginx hash warning.
+
 ## [1.1.0] - 2026-11-28
 
 Whitespace around values is ignored, and list variables may span several

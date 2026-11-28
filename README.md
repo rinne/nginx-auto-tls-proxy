@@ -451,8 +451,8 @@ a `resolver`, so nginx re-resolves at request time:
 
 ```nginx
 resolver 127.0.0.11 valid=5s;
-set $upstream_app_example_com http://app:3000;
-proxy_pass $upstream_app_example_com$request_uri;
+set $natp_upstream http://app:3000;
+proxy_pass $natp_upstream$request_uri;
 ```
 
 `PROXY_RESOLVER` selects the resolver — `127.0.0.11` is Docker's embedded DNS and
@@ -1218,6 +1218,12 @@ docker compose pull && docker compose up -d
 
 Note that a `ports:` change needs `docker compose up -d` to recreate the
 container — `docker compose restart` will not pick it up.
+
+**1.1.0 → 1.1.1** fixes nginx refusing to start with long hostnames: from 38
+characters for proxy sites, 39 for TLS terminators and 47 for any site or
+alias, and above 64 because of the self-signed certificate. About 20 or more
+proxy sites no longer log a `variables_hash` warning at every start. Pull and
+recreate as above. No configuration changes.
 
 **1.0.4 → 1.1.0** ignores whitespace around values and lets list variables
 span several lines: whitespace and line breaks around their separators are

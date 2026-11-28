@@ -959,13 +959,18 @@ create_selfsigned_cert() {
         san="$san,DNS:$alias"
     done
 
+    # X.509 limits the common name to 64 characters, and openssl refuses a
+    # longer one. Clients match the SAN, so a longer hostname goes there only.
+    local subject="/CN=$site"
+    (( ${#site} > 64 )) && subject="/CN=nginx-auto-tls-proxy"
+
     if ! openssl req -x509 \
             -newkey rsa:2048 \
             -keyout "$ssl_dir/ssl.key" \
             -out    "$ssl_dir/ssl.crt" \
             -days   365 \
             -nodes \
-            -subj   "/CN=$site" \
+            -subj   "$subject" \
             -addext "subjectAltName=$san" \
             2>/dev/null; then
         err "openssl failed for $site"
@@ -1011,8 +1016,13 @@ generate_stream_config() {
     if [[ "$PROXY_RESOLVER" != "default" ]]; then
         resolver_lines="    resolver $PROXY_RESOLVER valid=$PROXY_RESOLVER_VALID;
     resolver_timeout 3s;"
-        proxy_pass_line="    set \$backend_${var_slug} $backend;
-    proxy_pass \$backend_${var_slug};"
+        # One variable name for every stream server, not one per site: nginx
+        # keeps variable names in a hash with 64-byte buckets, so per-site
+        # names derived from the hostname made nginx refuse to start for
+        # hostnames of 39+ characters. `set` runs per connection in its own
+        # server block, so sharing the name does not mix up backends.
+        proxy_pass_line="    set \$natp_backend $backend;
+    proxy_pass \$natp_backend;"
     else
         if [[ "${OCSP_STAPLING:-0}" == "1" ]]; then
             resolver_lines="    resolver 1.1.1.1 1.0.0.1 valid=300s;
@@ -1149,7 +1159,6 @@ NGINXEOF
 
     if [[ "$mode" == "proxy" ]]; then
         local proxy_url="${PROXY_MAP["$site"]}"
-        local var_slug="${site//[^a-zA-Z0-9]/_}"
         local resolver_lines=""
         local proxy_pass_lines=""
         # proxy_pass for PROXY_STREAM_PATHS locations. It cannot always be the
@@ -1163,8 +1172,11 @@ NGINXEOF
             local _proxy_var_url="${proxy_url%/}"
             resolver_lines="        resolver $PROXY_RESOLVER valid=$PROXY_RESOLVER_VALID;
         resolver_timeout 3s;"
-            proxy_pass_lines="        set \$upstream_${var_slug} ${_proxy_var_url};
-        proxy_pass \$upstream_${var_slug}\$request_uri;"
+            # One variable name for every site (see generate_stream_config):
+            # per-site names made nginx refuse to start for hostnames of 38+
+            # characters, and warn about the variables hash from ~20 sites.
+            proxy_pass_lines="        set \$natp_upstream ${_proxy_var_url};
+        proxy_pass \$natp_upstream\$request_uri;"
             stream_proxy_pass_lines="$proxy_pass_lines"
         else
             proxy_pass_lines="        proxy_pass $proxy_url;"

@@ -125,8 +125,8 @@ curl -fksS --resolve "proxy.local:$HTTPS_PORT:127.0.0.1" \
 
 "${COMPOSE[@]}" exec -T proxy sh -c \
     "grep -q 'resolver 127.0.0.11 valid=5s' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf \
-     && grep -q 'set \$upstream_proxy_local' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf \
-     && grep -q 'proxy_pass \$upstream_proxy_local\$request_uri' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf"
+     && grep -q 'set \$natp_upstream http://backend' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf \
+     && grep -q 'proxy_pass \$natp_upstream\$request_uri' /etc/nginx/conf.d/nginx-auto-tls-proxy-proxy.local.conf"
 
 # --- SITE_REWRITES coverage ---
 # The generated config carries a quoted, internal `rewrite ... last;` line.
@@ -801,6 +801,37 @@ switch_log="$(docker run --rm \
 grep -q 'LETSENCRYPT_DISABLE=true is treated as 0 (off)' <<< "$switch_log" \
     || { printf 'FAIL: LETSENCRYPT_DISABLE=true should warn that it is treated as 0\n'; exit 1; }
 
+# --- Long hostnames and many sites (DRY_RUN) ---
+# Up to 1.1.0 nginx refused to start with long hostnames: upstream variables
+# were named after the site ($upstream_<host> from 38 characters, stream
+# $backend_<host> from 39) and overflowed the 64-byte variables hash buckets,
+# server names from 47 characters overflowed server_names_hash, and names over
+# 64 characters made openssl reject the self-signed certificate's CN. About 20
+# proxy sites also made nginx warn about the variables hash. Any valid hostname
+# (up to 253 characters) must now work for every site type and alias.
+label63="$(printf 'a%.0s' $(seq 63))"
+max_host="$label63.$label63.$label63.$(printf 'b%.0s' $(seq 61))"
+long_host="a-rather-long-service-name.staging-environment.example-company.local"
+[ "${#max_host}" -eq 253 ] || { printf 'FAIL: test setup, max_host is %s characters\n' "${#max_host}"; exit 1; }
+many_sites=""
+for i in $(seq 100); do
+    many_sites+="service-$i.dev01.example-company.local:http://svc$i:8080/,"
+done
+long_log="$(docker run --rm \
+    -e STATIC_SITES="$max_host,static-$long_host" \
+    -e PROXY_SITES="$long_host:http://backend:8080/,$many_sites" \
+    -e SITE_ALIASES="$long_host:alias-$long_host" \
+    -e SITE_REDIRECTS="old-$long_host:$long_host:deep" \
+    -e TLS_TERMINATOR_PROXY="tls-$long_host:4343:backend:5432" \
+    -e PROXY_STREAM_PATHS="$long_host:/events" \
+    -e DRY_RUN=1 \
+    "$PORT_IMG" 2>&1)" \
+    || { printf 'FAIL: long hostnames or 100 proxy sites stopped the container\n%s\n' "$long_log"; exit 1; }
+grep -q 'could not build' <<< "$long_log" \
+    && { printf 'FAIL: nginx warned about a hash size\n%s\n' "$long_log"; exit 1; }
+grep -q 'DRY_RUN=1 set' <<< "$long_log" \
+    || { printf 'FAIL: long-hostname dry run did not complete\n%s\n' "$long_log"; exit 1; }
+
 # --- SITE_ALLOWED_IPS config generation & validation (DRY_RUN) ---
 # Positive: a rule written against an ALIAS lands on the owner's HTTPS block,
 # IPv6 brackets are stripped, and the list is closed with `deny all;`.
@@ -896,7 +927,7 @@ docker run --rm \
 /entrypoint.sh >/dev/null 2>&1
 grep -q "listen 4343 ssl" /etc/nginx/stream.d/nginx-auto-tls-proxy-stream.local.conf \
     || { echo "FAIL: stream.local should listen on 4343 in stream.d"; exit 1; }
-grep -q "proxy_pass \$backend_stream_local" /etc/nginx/stream.d/nginx-auto-tls-proxy-stream.local.conf \
+grep -q "proxy_pass \$natp_backend;" /etc/nginx/stream.d/nginx-auto-tls-proxy-stream.local.conf \
     || { echo "FAIL: stream.local should use variable proxy_pass"; exit 1; }
 grep -q "ssl_protocols" /etc/nginx/stream.d/nginx-auto-tls-proxy-stream.local.conf \
     || { echo "FAIL: stream config should include ssl_protocols"; exit 1; }
