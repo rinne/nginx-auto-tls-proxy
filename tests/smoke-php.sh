@@ -53,6 +53,7 @@ cat > "$TMP_DIR/php-site/lookup.php" <<'PHPEOF'
 PHPEOF
 
 # Static-site fixture: drop a .php file that MUST NOT be executed.
+printf 'static-site robots\n' > "$TMP_DIR/static-site/robots.txt"
 cat > "$TMP_DIR/static-site/index.html" <<'HTMLEOF'
 <html><body>static-site OK</body></html>
 HTMLEOF
@@ -90,6 +91,7 @@ services:
       # to everyone else.
       SITE_ALLOWED_IPS: "php.local:127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,[2001:db8::/32]"
       HTTP3_SITES: "php.local"
+      ROBOTS_TXT_DENY_HOSTS: "www.php.local"
       LETSENCRYPT_EMAIL: ""
       CLIENT_MAX_BODY_SIZE: "16m"
       PROXY_READ_TIMEOUT: "60s"
@@ -201,6 +203,14 @@ fi
 # nginx config, not from a missing fixture).
 "${COMPOSE[@]}" exec -T proxy test -f /sites/static.local/bad.php \
     || { printf 'FAIL: bad.php fixture not present in static-site docroot inside the container\n'; exit 1; }
+
+# --- Generated robots.txt on a static-php site; a site in neither list keeps its own. ---
+robots_php="$(curl -fksS --resolve "php.local:$HTTPS_PORT:127.0.0.1" "https://php.local:$HTTPS_PORT/robots.txt"; printf x)"
+[ "${robots_php%x}" = $'User-agent: *\nDisallow: /\n' ] \
+    || { printf 'FAIL: php.local/robots.txt should be the generated deny file; got:\n%s\n' "${robots_php%x}"; exit 1; }
+curl -fksS --resolve "static.local:$HTTPS_PORT:127.0.0.1" "https://static.local:$HTTPS_PORT/robots.txt" \
+    | grep -qx 'static-site robots' \
+    || { printf 'FAIL: static.local/robots.txt should be served from the site itself\n'; exit 1; }
 
 # --- SITE_ALLOWED_IPS on a static-php site. ---
 # The allow/deny list must be emitted on the static-php HTTPS block; because the

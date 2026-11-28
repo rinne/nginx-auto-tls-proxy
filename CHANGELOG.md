@@ -2,6 +2,19 @@
 
 All notable changes to `nginx-auto-tls-proxy` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-28
+
+Generated robots.txt. Pull and recreate the container; nothing changes unless
+the new variables are set.
+
+### Added
+
+- `ROBOTS_TXT_DENY_HOSTS` and `ROBOTS_TXT_ALLOW_HOSTS` make the proxy answer `/robots.txt` itself, as `text/plain`: `User-agent: *` with `Disallow: /` for denied sites and an empty `Disallow:` for allowed ones. Each takes hostnames or aliases, or `*` for every site with an HTTP layer (static, PHP, proxy and redirect sites; TLS terminators are skipped, and naming one is an error). A site in both lists is denied, except that an explicit `ROBOTS_TXT_ALLOW_HOSTS` entry beats `ROBOTS_TXT_DENY_HOSTS="*"`. Sites in neither list are unchanged. The generated file is not proxied, redirected or captured by `SITE_REWRITES`, and basic auth does not apply to it; `SITE_ALLOWED_IPS` does. The startup site plan shows `robots=deny` or `robots=allow`. See the README section "Generated robots.txt".
+
+### Changed
+
+- Both smoke tests check the generated files live (exact body and `Content-Type`; alias, proxy, redirect, PHP and IP-locked sites; a `SITE_REWRITES` rule for `/robots.txt` that must not win; a site in neither list that serves its own file), and `tests/smoke.sh` checks the precedence rules and the error cases in dry runs.
+
 ## [1.1.1] - 2026-11-28
 
 Long hostnames and many proxy sites no longer stop nginx from starting. Pull

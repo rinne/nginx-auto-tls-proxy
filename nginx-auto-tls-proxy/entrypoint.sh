@@ -256,6 +256,30 @@ nginx_allow_lines() {
     printf '%s    deny all;\n' "${SITE_ALLOWED_IPS_MAP["$site"]}"
 }
 
+# Generated /robots.txt for a site (from ROBOTS_TXT_DENY_HOSTS and
+# ROBOTS_TXT_ALLOW_HOSTS), served from the file written at startup. A static
+# file is served in the content phase, after the access phase, so
+# SITE_ALLOWED_IPS applies to it; a `return 200 "..."` would answer in the
+# rewrite phase and bypass the allow list. The exact-match location wins over
+# every prefix and regex location, including proxy_pass and PHP. Server-level
+# rewrites run before any location is chosen, so the `break` comes before
+# SITE_REWRITES: it ends the server's rewrite processing for this one path,
+# and a catch-all rewrite cannot capture it (and is why this is `root`, not
+# `alias`: nginx refuses alias once the URI has been through a rewrite). No
+# auth_basic here (it is set per location), so crawlers can read the file on a
+# protected site.
+ROBOTS_DIR=/etc/nginx-auto-tls-proxy/robots
+nginx_robots_lines() {
+    local site="$1"
+    [[ -n "${ROBOTS_MAP["$site"]:-}" ]] || return 0
+    cat <<EOF
+    rewrite ^/robots\.txt\$ /robots.txt break;
+    location = /robots.txt {
+        root $ROBOTS_DIR/${ROBOTS_MAP["$site"]};
+    }
+EOF
+}
+
 # Curated sensitive-path denylist applied to STATIC_PHP_SITES server blocks.
 nginx_php_denylist() {
     cat <<'EOF'
@@ -316,6 +340,7 @@ for _setting in \
     TLS_TERMINATOR_PROXY SITE_ALIASES STATIC_SITE_ROOTS BASIC_AUTH_FILES \
     SITE_ALLOWED_IPS DEFAULT_SITE HTTPS_PORT_OVERRIDE PROXY_STREAM_PATHS \
     HTTP3_SITES REAL_IP_FROM REAL_IP_HEADER \
+    ROBOTS_TXT_DENY_HOSTS ROBOTS_TXT_ALLOW_HOSTS \
     CLIENT_MAX_BODY_SIZE PROXY_READ_TIMEOUT PROXY_SEND_TIMEOUT \
     PROXY_RESOLVER PROXY_RESOLVER_VALID \
     HSTS_MAX_AGE OCSP_STAPLING STRICT_SNI STATIC_FALLBACK_PAGES \
@@ -357,6 +382,7 @@ declare -A SITE_ALLOWED_IPS_MAP=()
 declare -A PROXY_STREAM_MAP=()
 declare -A PROXY_STREAM_SEEN=()
 declare -A HTTP3_SITE_MAP=()
+declare -A ROBOTS_MAP=()
 declare -A HTTP3_PORTS=()
 declare -A HTTP3_REUSEPORT_SITE=()
 declare -A SITE_ALIASES_MAP=()
@@ -878,6 +904,67 @@ if [[ -n "$HTTP3_SITES_RAW" ]]; then
     done
 fi
 
+# robots.txt: ROBOTS_TXT_DENY_HOSTS / ROBOTS_TXT_ALLOW_HOSTS = host1,host2 |
+# '*' (every site with an HTTP layer) | '' (off). Hosts may be aliases and
+# resolve to the owning site, as for HTTP3_SITES; TLS-terminator sites have no
+# HTTP layer, so '*' skips them and naming one is an error. A site in both
+# lists is denied, except that an explicit ALLOW entry beats DENY='*'. Sites in
+# neither list are untouched: /robots.txt goes to the site like any request.
+declare -A _robots_deny=() _robots_allow=()
+_robots_deny_all=0
+_robots_allow_all=0
+parse_robots_hosts() {
+    local var="$1" value="${!1:-}"
+    local -n _rh_set="$2" _rh_all="$3"
+    [[ -n "$value" ]] || return 0
+    if [[ "$value" == "*" ]]; then
+        _rh_all=1
+        return 0
+    fi
+    [[ "$value" == *"*"* ]] \
+        && die "$var '*' selects every site and cannot be combined with other entries; got: $value"
+    local _rh_p _rh_host _rh_owner
+    split_list ',' "$value" _parts
+    for _rh_p in "${_parts[@]}"; do
+        _rh_host="$(lower "$(trim_spaces "$_rh_p")")"
+        [[ -z "$_rh_host" ]] && continue
+        require_hostname "$_rh_host" "$var"
+        [[ "${SERVER_NAME_OWNER["$_rh_host"]+isset}" == "isset" ]] \
+            || die "$var host must be a configured site or alias: $_rh_host"
+        _rh_owner="${SERVER_NAME_OWNER["$_rh_host"]}"
+        [[ "$(site_mode "$_rh_owner")" == "tls-terminator" ]] \
+            && die "$var cannot be used with TLS_TERMINATOR_PROXY site: $_rh_owner (no HTTP layer to serve robots.txt)"
+        _rh_set["$_rh_owner"]=1
+    done
+}
+parse_robots_hosts ROBOTS_TXT_DENY_HOSTS _robots_deny _robots_deny_all
+parse_robots_hosts ROBOTS_TXT_ALLOW_HOSTS _robots_allow _robots_allow_all
+for _site in "${ALL_SITES[@]}"; do
+    [[ "$(site_mode "$_site")" == "tls-terminator" ]] && continue
+    _r_deny=0
+    _r_allow=0
+    [[ "$_robots_deny_all" == "1" || "${_robots_deny["$_site"]+isset}" == "isset" ]] && _r_deny=1
+    [[ "$_robots_allow_all" == "1" || "${_robots_allow["$_site"]+isset}" == "isset" ]] && _r_allow=1
+    if [[ "$_r_deny" == "1" && "$_r_allow" == "1" ]]; then
+        # Only DENY='*' against an explicit ALLOW entry goes to ALLOW.
+        if [[ "$_robots_deny_all" == "1" && "$_robots_allow_all" != "1" ]]; then
+            ROBOTS_MAP["$_site"]=allow
+        else
+            ROBOTS_MAP["$_site"]=deny
+        fi
+    elif [[ "$_r_deny" == "1" ]]; then
+        ROBOTS_MAP["$_site"]=deny
+    elif [[ "$_r_allow" == "1" ]]; then
+        ROBOTS_MAP["$_site"]=allow
+    fi
+done
+if [[ ${#ROBOTS_MAP[@]} -gt 0 ]]; then
+    mkdir -p "$ROBOTS_DIR/deny" "$ROBOTS_DIR/allow"
+    printf 'User-agent: *\nDisallow: /\n' > "$ROBOTS_DIR/deny/robots.txt"
+    printf 'User-agent: *\nDisallow:\n' > "$ROBOTS_DIR/allow/robots.txt"
+    chmod 644 "$ROBOTS_DIR/deny/robots.txt" "$ROBOTS_DIR/allow/robots.txt"
+fi
+
 # `reuseport` may appear on only one listen directive per address:port, and QUIC
 # needs it: without it the workers share one UDP socket and packets land on
 # workers that do not hold the connection, so handshakes stall intermittently.
@@ -1147,6 +1234,7 @@ $(nginx_ocsp_lines "$site")
 $(nginx_hsts_line)
     include /etc/nginx/site-conf.d/$site/*.conf;
 $(nginx_allow_lines "$site")
+$(nginx_robots_lines "$site")
     location / {
 $(nginx_auth_lines "$site")
         return 302 $http_redirect_target;
@@ -1195,6 +1283,7 @@ $(nginx_ocsp_lines "$site")
 $(nginx_hsts_line)
     include /etc/nginx/site-conf.d/$site/*.conf;
 $(nginx_allow_lines "$site")
+$(nginx_robots_lines "$site")
     location / {
 $(nginx_auth_lines "$site")
 $resolver_lines
@@ -1266,6 +1355,7 @@ $(nginx_ocsp_lines "$site")
 $(nginx_hsts_line)
     include /etc/nginx/site-conf.d/$site/*.conf;
 $(nginx_allow_lines "$site")
+$(nginx_robots_lines "$site")
     root "$site_root";
     index index.php index.html index.htm;
 $(nginx_static_fallback_lines)
@@ -1310,6 +1400,7 @@ $(nginx_ocsp_lines "$site")
 $(nginx_hsts_line)
     include /etc/nginx/site-conf.d/$site/*.conf;
 $(nginx_allow_lines "$site")
+$(nginx_robots_lines "$site")
     root "$site_root";
     index index.html index.htm;
 $(nginx_static_fallback_lines)
@@ -1366,7 +1457,9 @@ print_startup_summary() {
         fi
         local _h3_info=""
         site_has_http3 "$site" && _h3_info=" http3=on"
-        log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")${_port_info}${_rw_info}${_ip_info}${_sp_info}${_h3_info}"
+        local _robots_info=""
+        [[ -n "${ROBOTS_MAP["$site"]:-}" ]] && _robots_info=" robots=${ROBOTS_MAP["$site"]}"
+        log "  $site mode=$mode aliases=${aliases:-<none>} target=$target cert=$(cert_source "$site")${_port_info}${_rw_info}${_ip_info}${_sp_info}${_h3_info}${_robots_info}"
     done
 }
 

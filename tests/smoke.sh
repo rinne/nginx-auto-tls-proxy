@@ -61,12 +61,17 @@ services:
         proxy.local :
           http://backend/
       SITE_ALIASES: "default.local:www.default.local"
+      # Every site denies crawlers except default.local (named through its
+      # alias) and custom.local, which beat the '*'.
+      ROBOTS_TXT_DENY_HOSTS: "*"
+      ROBOTS_TXT_ALLOW_HOSTS: "www.default.local, custom.local"
       SITE_REDIRECTS: |
         shallow.local : default.local ,
         deep.local : default.local : deep ,
         explicit.local : default.local : no-deep
       SITE_REWRITES: |
         default.local ^/code/([A-Z]{4}-[A-Z]{4})\$ /landing.html
+        default.local ^/robots\.txt\$ /landing.html
       SITE_ALLOWED_IPS: |
         allowed.local: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, [2001:db8::/32];
         locked.local:
@@ -200,6 +205,33 @@ curl -fsS -H 'Host: shallow.local' \
     "http://127.0.0.1:$HTTP_PORT/.well-known/acme-challenge/shallow-token" \
     | grep -q 'challenge-shallow' \
     || { printf 'FAIL: ACME challenge passthrough broken on redirect source shallow.local\n'; exit 1; }
+
+# --- Generated robots.txt (ROBOTS_TXT_DENY_HOSTS / ROBOTS_TXT_ALLOW_HOSTS) ---
+robots_deny=$'User-agent: *\nDisallow: /\n'
+robots_allow=$'User-agent: *\nDisallow:\n'
+robots_check() {
+    local host="$1" want="$2" what="$3" got ctype
+    got="$(curl -fksS --resolve "$host:$HTTPS_PORT:127.0.0.1" "https://$host:$HTTPS_PORT/robots.txt"; printf x)"
+    got="${got%x}"
+    [ "$got" = "$want" ] \
+        || { printf 'FAIL: %s/robots.txt should be the %s file; got:\n%s\n' "$host" "$what" "$got"; exit 1; }
+    ctype="$(curl -ksS -o /dev/null -w '%{content_type}' --resolve "$host:$HTTPS_PORT:127.0.0.1" "https://$host:$HTTPS_PORT/robots.txt")"
+    [ "$ctype" = "text/plain" ] \
+        || { printf 'FAIL: %s/robots.txt Content-Type is %s, expected text/plain\n' "$host" "$ctype"; exit 1; }
+}
+# An explicit ALLOW entry beats DENY='*', also through an alias, and the
+# site's own SITE_REWRITES rule for /robots.txt does not capture it.
+robots_check default.local "$robots_allow" allow
+robots_check www.default.local "$robots_allow" allow
+robots_check custom.local "$robots_allow" allow
+# DENY='*' reaches proxy and redirect sites: generated, not proxied or redirected.
+robots_check proxy.local "$robots_deny" deny
+robots_check shallow.local "$robots_deny" deny
+# SITE_ALLOWED_IPS still applies to it.
+robots_locked="$(curl -ksS -o /dev/null -w '%{http_code}' \
+    --resolve "locked.local:$HTTPS_PORT:127.0.0.1" "https://locked.local:$HTTPS_PORT/robots.txt")"
+[ "$robots_locked" = "403" ] \
+    || { printf 'FAIL: locked.local/robots.txt returned %s, expected 403 from its allow list\n' "$robots_locked"; exit 1; }
 
 # --- SITE_ALLOWED_IPS coverage ---
 # The generated HTTPS block carries the allow/deny list; IPv6 brackets are
@@ -831,6 +863,43 @@ grep -q 'could not build' <<< "$long_log" \
     && { printf 'FAIL: nginx warned about a hash size\n%s\n' "$long_log"; exit 1; }
 grep -q 'DRY_RUN=1 set' <<< "$long_log" \
     || { printf 'FAIL: long-hostname dry run did not complete\n%s\n' "$long_log"; exit 1; }
+
+# --- robots.txt precedence and validation (DRY_RUN) ---
+# A site in both lists is denied, except an explicit ALLOW entry beats
+# DENY='*'; '*' skips TLS terminators; naming one, an unknown host, or '*'
+# mixed with names is an error.
+robots_plan() {
+    docker run --rm -e DRY_RUN=1 \
+        -e STATIC_SITES="a.local,b.local" \
+        -e TLS_TERMINATOR_PROXY="t.local:4343:backend:5432" \
+        "$@" "$PORT_IMG" 2>&1
+}
+robots_expect() {
+    local plan="$1" site="$2" want="$3" got
+    got="$(grep -oE "  $site mode=.*" <<< "$plan" | grep -oE 'robots=[a-z]+' || true)"
+    [ "$got" = "$want" ] \
+        || { printf 'FAIL: %s should have %s, got %s\n%s\n' "$site" "${want:-no robots}" "${got:-no robots}" "$plan"; exit 1; }
+}
+plan="$(robots_plan -e ROBOTS_TXT_DENY_HOSTS="a.local" -e ROBOTS_TXT_ALLOW_HOSTS="a.local,b.local")"
+robots_expect "$plan" a.local robots=deny
+robots_expect "$plan" b.local robots=allow
+plan="$(robots_plan -e ROBOTS_TXT_DENY_HOSTS="*" -e ROBOTS_TXT_ALLOW_HOSTS="*")"
+robots_expect "$plan" a.local robots=deny
+robots_expect "$plan" t.local ""
+plan="$(robots_plan -e ROBOTS_TXT_DENY_HOSTS="b.local" -e ROBOTS_TXT_ALLOW_HOSTS="*")"
+robots_expect "$plan" a.local robots=allow
+robots_expect "$plan" b.local robots=deny
+plan="$(robots_plan -e ROBOTS_TXT_DENY_HOSTS="*" -e ROBOTS_TXT_ALLOW_HOSTS="b.local")"
+robots_expect "$plan" a.local robots=deny
+robots_expect "$plan" b.local robots=allow
+plan="$(robots_plan)"
+robots_expect "$plan" a.local ""
+grep -q "cannot be combined with other entries" <<< "$(robots_plan -e ROBOTS_TXT_DENY_HOSTS="*,a.local")" \
+    || { printf 'FAIL: ROBOTS_TXT_DENY_HOSTS should reject * mixed with names\n'; exit 1; }
+grep -q "ROBOTS_TXT_ALLOW_HOSTS host must be a configured site or alias" <<< "$(robots_plan -e ROBOTS_TXT_ALLOW_HOSTS="nope.local")" \
+    || { printf 'FAIL: ROBOTS_TXT_ALLOW_HOSTS should reject an unknown host\n'; exit 1; }
+grep -q "cannot be used with TLS_TERMINATOR_PROXY site" <<< "$(robots_plan -e ROBOTS_TXT_DENY_HOSTS="t.local")" \
+    || { printf 'FAIL: ROBOTS_TXT_DENY_HOSTS should reject a TLS terminator site\n'; exit 1; }
 
 # --- SITE_ALLOWED_IPS config generation & validation (DRY_RUN) ---
 # Positive: a rule written against an ALIAS lands on the owner's HTTPS block,

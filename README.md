@@ -117,6 +117,8 @@ docker compose -f dc/try/docker-compose.yaml down -v
 | `PROXY_RESOLVER_VALID` | `5s` | How long nginx caches a resolved upstream address; default `5s`. Ignored when `PROXY_RESOLVER=default`. |
 | `HTTPS_PORT_OVERRIDE` | `admin.example.com:4444` | Comma-separated `host:port` pairs serving specific hosts on a non-443 HTTPS port. Port `80` is rejected; `443` is a no-op. See [Non-Standard HTTPS Ports](#non-standard-https-ports). |
 | `HTTP3_SITES` | `app.example.com,www.example.com` | Comma-separated hostnames to serve over HTTP/3 (QUIC) in addition to HTTP/2. `*` enables every eligible site; empty or unset disables HTTP/3 entirely. **Requires publishing the UDP port.** See [HTTP/3](#http3-quic). |
+| `ROBOTS_TXT_DENY_HOSTS` | `staging.example.com,dev.example.com` | Comma-separated hosts, or `*` for every site with an HTTP layer, whose `/robots.txt` is generated to keep all crawlers out. See [Generated robots.txt](#generated-robotstxt). |
+| `ROBOTS_TXT_ALLOW_HOSTS` | `www.example.com` | Comma-separated hosts, or `*`, whose `/robots.txt` is generated to let all crawlers in. See [Generated robots.txt](#generated-robotstxt). |
 | `STRICT_SNI` | `1` | Reject connections whose SNI matches no configured site, on every HTTPS port. Default `1`. `0` restores the pre-0.10.0 behaviour where `HTTPS_PORT_OVERRIDE` ports served the first site instead. See [Unknown Hostnames](#unknown-hostnames-strict_sni). |
 | `PHP_FPM_PROFILE` | `M` | One of `S`, `M`, `L`, `XL`, `XXL` (case-insensitive). FPM pool sizing profile; default `M`. See [PHP-Enabled Sites](#php-enabled-sites). |
 | `PHP_MEMORY_LIMIT` | `128M` | PHP `memory_limit`; default `128M`. Format: integer + optional `K`/`M`/`G`, or `-1` for unlimited. |
@@ -789,6 +791,52 @@ first site over HTTP/2 but to the first *HTTP/3* site over HTTP/3 — which may 
 a different site. Startup warns when this applies. The default `STRICT_SNI=1`
 has no such asymmetry, since both protocols simply refuse.
 
+## Generated robots.txt
+
+Two variables let the proxy answer `/robots.txt` itself, so sites that should
+not be indexed (staging, internal tools) need no file of their own:
+
+```yaml
+    environment:
+      ROBOTS_TXT_DENY_HOSTS: "*"
+      ROBOTS_TXT_ALLOW_HOSTS: "www.example.com, docs.example.com"
+```
+
+A site in `ROBOTS_TXT_DENY_HOSTS` serves, as `text/plain`:
+
+```
+User-agent: *
+Disallow: /
+```
+
+and a site in `ROBOTS_TXT_ALLOW_HOSTS`:
+
+```
+User-agent: *
+Disallow:
+```
+
+- Each variable takes hostnames or aliases (an alias applies to its whole
+  site), or `*` for every static, PHP, proxy and redirect site. `*` cannot be
+  combined with names. TLS terminator sites have no HTTP layer: `*` skips them,
+  and naming one is an error, as is a host that is not configured.
+- A site in both lists is denied, with one exception: when
+  `ROBOTS_TXT_DENY_HOSTS` is `*` and `ROBOTS_TXT_ALLOW_HOSTS` names the site,
+  it is allowed. That makes "deny everything except these" one line each. With
+  both set to `*`, every site is denied.
+- A site in neither list is left alone: `/robots.txt` goes to the site like
+  any other request, so a file in its root or the upstream's own answer is
+  served.
+- The generated file wins over everything else on the site: it is not proxied
+  to the upstream, not redirected on redirect sites, and not captured by
+  `SITE_REWRITES`. Basic auth (`BASIC_AUTH_FILES`) does not apply to it, so
+  crawlers can read it on a protected site; `SITE_ALLOWED_IPS` still does.
+- A `location = /robots.txt` in a site's own snippet under `site-conf.d`
+  clashes with the generated one, and nginx refuses to start. Leave such a
+  site out of both lists.
+- The startup site plan shows `robots=deny` or `robots=allow` for each site
+  that has one.
+
 ## TLS And Certificates
 
 On startup, every configured primary site gets a certificate path:
@@ -1218,6 +1266,11 @@ docker compose pull && docker compose up -d
 
 Note that a `ports:` change needs `docker compose up -d` to recreate the
 container — `docker compose restart` will not pick it up.
+
+**1.1.1 → 1.2.0** adds generated `/robots.txt` files
+(`ROBOTS_TXT_DENY_HOSTS`, `ROBOTS_TXT_ALLOW_HOSTS`, see
+[Generated robots.txt](#generated-robotstxt)). Nothing changes unless you set
+them. Pull and recreate as above.
 
 **1.1.0 → 1.1.1** fixes nginx refusing to start with long hostnames: from 38
 characters for proxy sites, 39 for TLS terminators and 47 for any site or
